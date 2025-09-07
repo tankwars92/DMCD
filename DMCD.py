@@ -16,9 +16,17 @@ try:
     from Crypto.PublicKey import RSA
     from Crypto.Cipher import PKCS1_OAEP
 except ImportError:
-    import sys
-    sys.stderr.write("You need to install pycryptodome module: pip install pycryptodome.")
-    sys.exit(1)
+    try:
+        from Cryptodome.Cipher import AES
+        from Cryptodome.Random import get_random_bytes
+        from Cryptodome.PublicKey import RSA
+        from Cryptodome.Cipher import PKCS1_OAEP
+    except ImportError:
+        import sys
+        sys.stderr.write(
+            "You need to install pycryptodome module: pip install pycryptodome\n"
+        )
+        sys.exit(1)
 
 # Change this!
 MY_SERVER_HOST = "example.com"
@@ -210,7 +218,7 @@ def handle_key_exchange(client_socket, client_address):
 
         client_keys.pop(client_address, None)
 
-def start_key_exchange_server(host='127.0.0.1', port=ENCRYPTED_PORT):
+def start_key_exchange_server(host='0.0.0.0', port=ENCRYPTED_PORT):
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.bind((host, port))
     server_socket.listen(5)
@@ -1344,7 +1352,7 @@ def handle_client(client_socket, client_address):
         log_message(f"TCP client {client_address} disconnected")
 
 
-def start_tcp_server(host='127.0.0.1', port=TCP_PORT):
+def start_tcp_server(host='0.0.0.0', port=TCP_PORT):
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.bind((host, port))
     server_socket.listen(5)
