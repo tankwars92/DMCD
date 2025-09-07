@@ -6,11 +6,28 @@ import time
 import os
 import re
 import hashlib
+import base64
+import random
+import struct
+
+try:
+    from Crypto.Cipher import AES
+    from Crypto.Random import get_random_bytes
+    from Crypto.PublicKey import RSA
+    from Crypto.Cipher import PKCS1_OAEP
+except ImportError:
+    import sys
+    sys.stderr.write("You need to install pycryptodome module: pip install pycryptodome.")
+    sys.exit(1)
 
 # Change this!
 MY_SERVER_HOST = "example.com"
 TCP_PORT = 42439
+ENCRYPTED_PORT = 42440
 ADMIN_USERNAME = "ADMIN"
+
+AES_KEY_SIZE = 32
+IV_SIZE = 16
 
 users_file = 'users.json'
 bans_file = 'bans.json'
@@ -19,6 +36,7 @@ servers_dir = 'servers'
 clients_by_user = {}
 clients_by_server = {}
 socket_to_session = {}
+client_keys = {}
 
 session_lock = threading.RLock()
 
@@ -27,6 +45,181 @@ os.makedirs(servers_dir, exist_ok=True)
 def log_message(message):
     current_time = time.strftime("%H:%M:%S", time.localtime())
     print(f"[{current_time}] {message}")
+
+def generate_aes_key():
+    return get_random_bytes(AES_KEY_SIZE)
+
+def derive_session_keys(shared_bytes):
+    try:
+        import hashlib
+        enc_key = hashlib.sha256(shared_bytes + b"|KEY").digest()
+        mac_key = hashlib.sha256(shared_bytes + b"|MAC").digest()
+        return enc_key, mac_key
+    except Exception as e:
+        log_message(f"Key derivation error: {e}")
+        return None, None
+
+DH_P = int(
+    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1"
+    "29024E088A67CC74020BBEA63B139B22514A08798E3404DD"
+    "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245"
+    "E485B576625E7EC6F44C42E9A63A3620FFFFFFFFFFFFFFFF", 16)
+DH_G = 2
+
+
+def encrypt_message(message, key):
+    try:
+        iv = get_random_bytes(IV_SIZE)
+        
+        message_bytes = message.encode('utf-8')
+        padding_length = 16 - (len(message_bytes) % 16)
+        padded_message = message_bytes + bytes([padding_length] * padding_length)
+        
+        cipher = AES.new(key, AES.MODE_CBC, iv)
+        encrypted = cipher.encrypt(padded_message)
+        
+        return iv + encrypted
+    except Exception as e:
+        log_message(f"Encryption error: {e}")
+        return None
+
+def decrypt_message(encrypted_data, key):
+    try:
+        if len(encrypted_data) < IV_SIZE:
+            return None
+            
+        iv = encrypted_data[:IV_SIZE]
+        encrypted = encrypted_data[IV_SIZE:]
+        
+        cipher = AES.new(key, AES.MODE_CBC, iv)
+        decrypted = cipher.decrypt(encrypted)
+        
+        padding_length = decrypted[-1]
+        if padding_length > 16 or padding_length == 0:
+            return None
+            
+        message_bytes = decrypted[:-padding_length]
+        return message_bytes.decode('utf-8')
+    except Exception as e:
+        log_message(f"Decryption error: {e}")
+        return None
+
+def send_encrypted_message(socket, message, key, mac_key=None):
+    try:
+        encrypted = encrypt_message(message, key)
+        if encrypted:
+            payload = encrypted
+            if mac_key is not None:
+                import hmac, hashlib
+                mac = hmac.new(mac_key, payload, hashlib.sha256).digest()
+                payload = payload + mac
+            length = struct.pack('>I', len(payload))
+            socket.send(length + payload)
+            return True
+    except Exception as e:
+        log_message(f"Error sending encrypted message: {e}")
+    return False
+
+def receive_encrypted_message(socket, key, mac_key=None):
+    try:
+        length_data = socket.recv(4)
+        if len(length_data) != 4:
+            return None
+            
+        length = struct.unpack('>I', length_data)[0]
+        
+        encrypted_data = b''
+        while len(encrypted_data) < length:
+            chunk = socket.recv(length - len(encrypted_data))
+            if not chunk:
+                return None
+            encrypted_data += chunk
+
+        if mac_key is not None and length >= 32:
+            data_part = encrypted_data[:-32]
+            mac_part = encrypted_data[-32:]
+            import hmac, hashlib
+            expected = hmac.new(mac_key, data_part, hashlib.sha256).digest()
+            if not hmac.compare_digest(mac_part, expected):
+                log_message("HMAC verification failed")
+                return None
+            encrypted_payload = data_part
+        else:
+            encrypted_payload = encrypted_data
+
+        decrypted = decrypt_message(encrypted_payload, key)
+        return decrypted.strip() if decrypted else None
+    except Exception as e:
+        log_message(f"Error receiving encrypted message: {e}")
+        return None
+
+def handle_key_exchange(client_socket, client_address):
+    try:
+        a = random.getrandbits(256)
+        A = pow(DH_G, a, DH_P)
+        A_bytes_len = (DH_P.bit_length() + 7) // 8
+        A_bytes = A.to_bytes(A_bytes_len, byteorder='big')
+        A_bytes = A_bytes.lstrip(b"\x00") or b"\x00"
+
+        client_socket.send(struct.pack('>H', len(A_bytes)) + A_bytes)
+
+        len_data = client_socket.recv(2)
+        if len(len_data) != 2:
+            raise Exception("Failed to receive DH B length")
+        blen = struct.unpack('>H', len_data)[0]
+        B_bytes = b''
+        while len(B_bytes) < blen:
+            chunk = client_socket.recv(blen - len(B_bytes))
+            if not chunk:
+                raise Exception("Failed to receive DH B")
+            B_bytes += chunk
+        try:
+            B = int.from_bytes(B_bytes, byteorder='big')
+        except Exception:
+            import binascii
+            B = int(binascii.hexlify(B_bytes), 16)
+
+        shared = pow(B, a, DH_P)
+        shared_len = (DH_P.bit_length() + 7) // 8
+        try:
+            shared_bytes = shared.to_bytes(shared_len, byteorder='big')
+        except Exception:
+            import binascii
+            hex_s = hex(shared)[2:].rstrip('L')
+            if len(hex_s) % 2:
+                hex_s = '0' + hex_s
+            shared_bytes = binascii.unhexlify(hex_s)
+        shared_bytes = shared_bytes.lstrip(b"\x00") or b"\x00"
+        import hashlib
+        enc_key, mac_key = derive_session_keys(shared_bytes)
+        aes_key = enc_key
+        
+        client_keys[client_address] = (aes_key, mac_key)
+        
+        
+        
+        handle_client(client_socket, client_address)
+        
+    except Exception as e:
+        log_message(f"Key exchange error for {client_address}: {e}")
+    finally:
+        try:
+            client_socket.close()
+        except:
+            pass
+
+        client_keys.pop(client_address, None)
+
+def start_key_exchange_server(host='127.0.0.1', port=ENCRYPTED_PORT):
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.bind((host, port))
+    server_socket.listen(5)
+    print(f"TCP encrypted server started on {host}:{port}")
+
+    while True:
+        client_socket, client_address = server_socket.accept()
+        client_thread = threading.Thread(target=handle_key_exchange, args=(client_socket, client_address))
+        client_thread.start()
 
 def load_users():
     if os.path.exists(users_file):
@@ -60,6 +253,83 @@ def load_bans():
 def save_bans(bans):
     with open(bans_file, 'w', encoding='utf-8') as f:
         json.dump(bans, f, ensure_ascii=False, indent=4)
+
+def is_valid_base64(s):
+    try:
+        if not re.match(r'^[A-Za-z0-9+/]*={0,2}$', s):
+            return False
+
+        decoded = base64.b64decode(s)
+        decoded.decode('utf-8')
+        return True
+    except Exception:
+        return False
+
+def decode_base64_password(encoded_password):
+    try:
+        if not is_valid_base64(encoded_password):
+            return None
+        decoded = base64.b64decode(encoded_password)
+        return decoded.decode('utf-8')
+    except Exception:
+        return None
+
+def is_md5_hash(s):
+    return len(s) == 32 and re.match(r'^[a-fA-F0-9]{32}$', s)
+
+def is_sha256_hash(s):
+    return len(s) == 64 and re.match(r'^[a-fA-F0-9]{64}$', s)
+
+def is_sha512_hash(s):
+    return len(s) == 128 and re.match(r'^[a-fA-F0-9]{128}$', s)
+
+def verify_password_hash(password, hash_value, hash_type):
+    try:
+        if hash_type == 'md5':
+            return hashlib.md5(password.encode('utf-8')).hexdigest() == hash_value
+        elif hash_type == 'sha256':
+            return hashlib.sha256(password.encode('utf-8')).hexdigest() == hash_value
+        elif hash_type == 'sha512':
+            return hashlib.sha512(password.encode('utf-8')).hexdigest() == hash_value
+        return False
+    except Exception:
+        return False
+
+def check_password_format(password):
+    if is_valid_base64(password):
+        decoded = decode_base64_password(password)
+        if decoded is not None:
+            return 'base64', decoded
+    
+    if is_md5_hash(password):
+        return 'md5', password
+    
+    if is_sha256_hash(password):
+        return 'sha256', password
+    
+    if is_sha512_hash(password):
+        return 'sha512', password
+    
+    return 'plain', password
+
+def authenticate_user(username, password, stored_users):    
+    if username not in stored_users:
+        return False
+    
+    stored_password = stored_users[username]
+    
+    if stored_password == password:
+        return True
+    
+    password_format, password_value = check_password_format(password)
+    
+    if password_format == 'base64':
+        return stored_password == password_value
+    
+    elif password_format in ['md5', 'sha256', 'sha512']:
+        return verify_password_hash(stored_password, password_value, password_format)
+    
+    return False
 
 users = load_users()
 bans = load_bans()
@@ -350,10 +620,16 @@ def broadcast_message(message, server_name, sender_session: 'Session' = None):
     try:
         with session_lock:
             sessions = list(clients_by_server.get(server_name, set()))
+
         for sess in sessions:
             if sender_session is not None and sess is sender_session:
                 continue
-            sess.send_text(message)
+            
+            client_key = get_client_encryption_key(sess)
+            if client_key:
+                send_to_client(sess.client_socket, message, client_key)
+            else:
+                sess.send_text(message)
     except Exception as e:
         log_message(f"broadcast_message error: {e}")
 
@@ -364,13 +640,27 @@ def send_private_message(sender_username: str, recipient_username: str, message:
         recipient_sessions = list(clients_by_user.get(recipient_username, set()))
     pm_text = f"(Private) {sender_username}: {message}"
     for sess in recipient_sessions:
-        ok = sess.send_text(pm_text)
+        client_key = get_client_encryption_key(sess)
+        if client_key:
+            ok = send_to_client(sess.client_socket, pm_text, client_key)
+        else:
+            ok = sess.send_text(pm_text)
         delivered_any = delivered_any or ok
     return delivered_any
 
 def get_safe_server_path(server_name):
     safe_name = os.path.basename(server_name)
     return safe_name
+
+def get_client_encryption_key(session):
+    if not hasattr(session, 'client_socket') or not session.client_socket:
+        return None
+    
+    try:
+        client_address = session.client_socket.getpeername()
+        return client_keys.get(client_address)
+    except:
+        return None
 
 commands = {
     "/login": "<username> <password> - Login with username and password.",
@@ -447,18 +737,50 @@ def deliver_remote_pm(sender, recipient, message, server_host=None, from_host=No
         log_message(f"[remote_pm] Failed to send remote_pm to {recipient}")
     return delivered_any
 
-def notify_tcp_result(client_socket, result, recipient):
+def notify_tcp_result(client_socket, result, recipient, client_key=None):
     try:
         if result:
-            client_socket.send(f"Private message sent to {recipient}.\n".encode('utf-8'))
+            send_to_client(client_socket, f"Private message sent to {recipient}.", client_key)
         else:
-            client_socket.send(f"Failed to send private message to {recipient}.\n".encode('utf-8'))
+            send_to_client(client_socket, f"Failed to send private message to {recipient}.", client_key)
     except Exception:
         pass
 
-def handle_remote_pm_tcp(sender, recipient, host, private_message, client_socket, recipient_display):
+def handle_remote_pm_tcp(sender, recipient, host, private_message, client_socket, recipient_display, client_key=None):
     result = _send_remote_private_message_sync(sender, recipient, host, private_message)
-    notify_tcp_result(client_socket, result, recipient_display)
+    notify_tcp_result(client_socket, result, recipient_display, client_key)
+
+def send_to_client(client_socket, message, client_key=None):
+    try:
+        if client_key:
+            if isinstance(client_key, tuple):
+                enc_key, mac_key = client_key
+            else:
+                enc_key, mac_key = client_key, None
+            return send_encrypted_message(client_socket, message, enc_key, mac_key)
+        else:
+            if not message.endswith('\n'):
+                message += '\n'
+            client_socket.send(message.encode('utf-8'))
+            return True
+    except Exception as e:
+        log_message(f"Error sending to client: {e}")
+        return False
+
+def receive_from_client(client_socket, client_key=None):
+    try:
+        if client_key:
+            if isinstance(client_key, tuple):
+                enc_key, mac_key = client_key
+            else:
+                enc_key, mac_key = client_key, None
+            return receive_encrypted_message(client_socket, enc_key, mac_key)
+        else:
+            data = client_socket.recv(1024).decode('utf-8').strip()
+            return data if data else None
+    except Exception as e:
+        log_message(f"Error receiving from client: {e}")
+        return None
 
 def handle_client(client_socket, client_address):
     global last_cmd
@@ -467,8 +789,11 @@ def handle_client(client_socket, client_address):
     user_server = None
     session = Session(client_socket)
     last_cmd = ""
+    
+    client_key = client_keys.get(client_address)
+    use_encryption = client_key is not None
 
-    log_message(f"TCP client {client_address} connected")
+    log_message(f"TCP client {client_address} connected {'(encrypted)' if use_encryption else '(unencrypted)'}")
 
     try:
         client_socket.settimeout(0.5)
@@ -654,10 +979,10 @@ def handle_client(client_socket, client_address):
 
         while not logged_in_user:
             if not last_cmd == "/":
-                client_socket.send("Enter command (/login /register): ".encode('utf-8'))
+                send_to_client(client_socket, "Enter command (/login /register): ", client_key)
             else:
-                client_socket.send("*Ping!*".encode('utf-8'))
-            command = client_socket.recv(1024).decode('utf-8').strip()
+                send_to_client(client_socket, "*Ping!*", client_key)
+            command = receive_from_client(client_socket, client_key)
 
             if not command:
                 break
@@ -670,24 +995,24 @@ def handle_client(client_socket, client_address):
             if command.startswith("/register"):
                 parts = command.split(" ", 2)
                 if len(parts) != 3:
-                    client_socket.send("Usage: /register <username> <password>\n".encode('utf-8'))
+                    send_to_client(client_socket, "Usage: /register <username> <password>", client_key)
                     continue
                 _, username, password = parts
                 username = username.replace('@', '_')
                 if username in users:
-                    client_socket.send("Username already taken. Try another.\n".encode('utf-8'))
+                    send_to_client(client_socket, "Username already taken. Try another.", client_key)
                     continue
                 users[username] = password
                 save_users(users)
-                client_socket.send("Registration successful. Please log in.\n".encode('utf-8'))
+                send_to_client(client_socket, "Registration successful. Please log in.", client_key)
 
             elif command.startswith("/login"):
                 parts = command.split(" ", 2)
                 if len(parts) != 3:
-                    client_socket.send("Usage: /login <username> <password>\n".encode('utf-8'))
+                    send_to_client(client_socket, "Usage: /login <username> <password>", client_key)
                     continue
                 _, username, password = parts
-                if users.get(username) == password:
+                if authenticate_user(username, password, users):
                     logged_in_user = username
                     session.username = username
                     with session_lock:
@@ -697,11 +1022,11 @@ def handle_client(client_socket, client_address):
                         else:
                             sessions.add(session)
                         socket_to_session[client_socket] = session
-                        client_socket.send("Login successful.\n".encode('utf-8'))
-                        client_socket.send(f"Available servers: {', '.join(servers.keys())}\n".encode('utf-8'))
-                        client_socket.send("Select a server using /join_server <server_name>.\n".encode('utf-8'))
+                        send_to_client(client_socket, "Login successful.", client_key)
+                        send_to_client(client_socket, f"Available servers: {', '.join(servers.keys())}", client_key)
+                        send_to_client(client_socket, "Select a server using /join_server <server_name>.", client_key)
                 else:
-                    client_socket.send("Invalid username or password.\n".encode('utf-8'))
+                    send_to_client(client_socket, "Invalid username or password.", client_key)
 
     except (ConnectionResetError, BrokenPipeError):
         log_message(f"TCP client {client_address} disconnected unexpectedly.")
@@ -711,7 +1036,7 @@ def handle_client(client_socket, client_address):
 
     try:
         while True:
-            message = client_socket.recv(1024).decode('utf-8').strip()
+            message = receive_from_client(client_socket, client_key)
 
             if not message:
                 break
@@ -723,26 +1048,26 @@ def handle_client(client_socket, client_address):
                 if message.startswith("/create_server"):
                     parts = message.split(" ", 1)
                     if len(parts) != 2:
-                        client_socket.send("Usage: /create_server <server_name>\n".encode('utf-8'))
+                        send_to_client(client_socket, "Usage: /create_server <server_name>", client_key)
                         continue
                     _, server_name = parts
                     server_name = get_safe_server_path(server_name)
                     if server_name in servers:
-                        client_socket.send("Server already exists.\n".encode('utf-8'))
+                        send_to_client(client_socket, "Server already exists.", client_key)
                     else:
                         servers[server_name] = []
                         save_server(server_name, servers[server_name])
-                        client_socket.send(f"Server '{server_name}' created successfully.\n".encode('utf-8'))
+                        send_to_client(client_socket, f"Server '{server_name}' created successfully.", client_key)
                 elif message.startswith("/join_server"):
                     parts = message.split(" ", 1)
                     if len(parts) != 2:
-                        client_socket.send("Usage: /join_server <server_name>\n".encode('utf-8'))
+                        send_to_client(client_socket, "Usage: /join_server <server_name>", client_key)
                         continue
                     _, server_spec = parts
                     room_name, host_part = parse_room_and_host(server_spec)
                     if host_part and host_part != MY_SERVER_HOST:
                         if user_server is not None:
-                            client_socket.send(f"You're already connected to the server '{user_server}'.\n".encode('utf-8'))
+                            send_to_client(client_socket, f"You're already connected to the server '{user_server}'.", client_key)
                             continue
                         user_server = f"{room_name}@{host_part}"
                         session.server_name = user_server
@@ -766,14 +1091,14 @@ def handle_client(client_socket, client_address):
                                 'sender': logged_in_user
                             }
                             send_remote_room_message(host_part, room_name, payload)
-                        client_socket.send(f"Joined server '{user_server}' successfully.\n".encode('utf-8'))
+                        send_to_client(client_socket, f"Joined server '{user_server}' successfully.", client_key)
                     else:
                         local_room = room_name
                         if local_room not in servers:
-                            client_socket.send("Server does not exist.\n".encode('utf-8'))
+                            send_to_client(client_socket, "Server does not exist.", client_key)
                         else:
                             if user_server != None:
-                                client_socket.send(f"You're already connected to the server '{user_server}'.\n".encode('utf-8'))
+                                send_to_client(client_socket, f"You're already connected to the server '{user_server}'.", client_key)
                             else:
                                 user_server = local_room
                                 session.server_name = local_room
@@ -801,17 +1126,17 @@ def handle_client(client_socket, client_address):
                                 if should_broadcast_join:
                                     broadcast_message(f"*** {logged_in_user} has joined the server.", user_server)
                                     _send_room_event_to_remotes(local_room, 'joined', logged_in_user, MY_SERVER_HOST)
-                                client_socket.send(f"Joined server '{local_room}' successfully.\n".encode('utf-8'))
+                                send_to_client(client_socket, f"Joined server '{local_room}' successfully.", client_key)
                 elif message.startswith("/delete_server") and logged_in_user == ADMIN_USERNAME:
                     parts = message.split(" ", 1)
                     if len(parts) != 2:
-                        client_socket.send("Usage: /delete_server <server_name>\n".encode('utf-8'))
+                        send_to_client(client_socket, "Usage: /delete_server <server_name>", client_key)
                         continue
                     _, server_name = parts
                     if server_name == default_server:
-                        client_socket.send(f"You cannot delete the default server '{default_server}'.\n".encode('utf-8'))
+                        send_to_client(client_socket, f"You cannot delete the default server '{default_server}'.", client_key)
                     elif server_name not in servers:
-                        client_socket.send(f"Server '{server_name}' does not exist.\n".encode('utf-8'))
+                        send_to_client(client_socket, f"Server '{server_name}' does not exist.", client_key)
                     else:
                         del servers[server_name]
                         if os.path.exists(os.path.join(servers_dir, f'{server_name}.json')):
@@ -819,13 +1144,13 @@ def handle_client(client_socket, client_address):
                         
                         broadcast_message(f"*** Server '{server_name}' has been deleted.", server_name)
                         
-                        client_socket.send(f"Server '{server_name}' deleted successfully.\n".encode('utf-8'))
+                        send_to_client(client_socket, f"Server '{server_name}' deleted successfully.", client_key)
 
                 elif message.startswith("/list_servers"):
-                    client_socket.send(f"Servers: {', '.join(servers.keys())}\n".encode('utf-8'))
+                    send_to_client(client_socket, f"Servers: {', '.join(servers.keys())}", client_key)
                 elif message.startswith("/members"):
                     if not (logged_in_user and user_server):
-                        client_socket.send("Please log in and join a server first.\n".encode('utf-8'))
+                        send_to_client(client_socket, "Please log in and join a server first.", client_key)
                         continue
 
                     room_name, host_part = parse_room_and_host(user_server)
@@ -836,20 +1161,20 @@ def handle_client(client_socket, client_address):
                         }
                         resp = send_remote_room_message(host_part, room_name, req)
                         if not resp or resp.get('status') != 'ok':
-                            client_socket.send("Failed to fetch members.\n".encode('utf-8'))
+                            send_to_client(client_socket, "Failed to fetch members.", client_key)
                             continue
                         members_raw = resp.get('members', [])
                         disp = [display_name_for(MY_SERVER_HOST, m['username'], m['origin']) for m in members_raw]
-                        client_socket.send(f"Members in '{user_server}': {', '.join(disp)}\n".encode('utf-8'))
+                        send_to_client(client_socket, f"Members in '{user_server}': {', '.join(disp)}", client_key)
                     else:
                         room = room_name
                         room_map = _room_members(room)
                         disp = [display_name_for(MY_SERVER_HOST, u, h) for (u,h) in room_map.keys()]
-                        client_socket.send(f"Members in '{user_server}': {', '.join(disp)}\n".encode('utf-8'))
+                        send_to_client(client_socket, f"Members in '{user_server}': {', '.join(disp)}", client_key)
                 elif message.startswith("/ban") and logged_in_user == ADMIN_USERNAME:
                     parts = message.split(" ", 1)
                     if len(parts) != 2:
-                        client_socket.send("Usage: /ban <username>\n".encode('utf-8'))
+                        send_to_client(client_socket, "Usage: /ban <username>", client_key)
                         continue
                     _, banned_user = parts
                     servers_to_notify = set()
@@ -888,10 +1213,10 @@ def handle_client(client_socket, client_address):
                     parts = message.split(" ", 1)
                     if len(parts) < 2:
                         if not logged_in_user or not username:
-                            client_socket.send("Please log in and join a server first.\n")
+                            send_to_client(client_socket, "Please log in and join a server first.", client_key)
                             continue
 
-                        client_socket.send("Usage: /act <act>\n".encode('utf-8'))
+                        send_to_client(client_socket, "Usage: /act <act>", client_key)
                         continue
 
                     _, act_name = parts 
@@ -911,33 +1236,33 @@ def handle_client(client_socket, client_address):
                 elif message.startswith("/pm"):
                     parts = message.split(" ", 2)
                     if len(parts) < 3:
-                        client_socket.send("Usage: /pm <username> <message>\n".encode('utf-8'))
+                        send_to_client(client_socket, "Usage: /pm <username> <message>", client_key)
                         continue
                     _, recipient, private_message = parts
                     m = re.match(r"^([\w\-]+)@([\w\.-]+)$", recipient)
                     if m:
                         remote_user, remote_host = m.group(1), m.group(2)
-                        threading.Thread(target=handle_remote_pm_tcp, args=(logged_in_user, remote_user, remote_host, private_message, client_socket, recipient), daemon=True).start()
+                        threading.Thread(target=handle_remote_pm_tcp, args=(logged_in_user, remote_user, remote_host, private_message, client_socket, recipient, client_key), daemon=True).start()
                         continue
                     if recipient not in users:
-                        client_socket.send("User does not exist.\n".encode('utf-8'))
+                        send_to_client(client_socket, "User does not exist.", client_key)
                         continue
                     if recipient == logged_in_user:
-                        client_socket.send("You cannot send private messages to yourself.\n".encode('utf-8'))
+                        send_to_client(client_socket, "You cannot send private messages to yourself.", client_key)
                         continue
                     if recipient in bans:
-                        client_socket.send(f"{recipient} is banned.\n".encode('utf-8'))
+                        send_to_client(client_socket, f"{recipient} is banned.", client_key)
                         continue
 
                     result = send_private_message(logged_in_user, recipient, private_message)
-                    notify_tcp_result(client_socket, result, recipient)
+                    notify_tcp_result(client_socket, result, recipient, client_key)
                 elif message.startswith("/help"):
                     help_message = "\n".join([f"{cmd} {desc}" for cmd, desc in commands.items()])
-                    client_socket.send(f"{help_message}\n".encode('utf-8'))
+                    send_to_client(client_socket, help_message, client_key)
                 elif message == "/":
-                    client_socket.send("*Ping!*".encode('utf-8'))
+                    send_to_client(client_socket, "*Ping!*", client_key)
                 else:
-                    client_socket.send("Unknown command.\n".encode('utf-8'))
+                    send_to_client(client_socket, "Unknown command.", client_key)
                         
             else:
                 if not logged_in_user in bans and logged_in_user and user_server:
@@ -1012,10 +1337,12 @@ def handle_client(client_socket, client_address):
                 client_socket.close()
             except Exception:
                 pass
+            client_keys.pop(client_address, None)
             if left_broadcast_needed:
                 u, srv = left_broadcast_needed
                 broadcast_message(f"*** {u} has left the server.", srv)
         log_message(f"TCP client {client_address} disconnected")
+
 
 def start_tcp_server(host='127.0.0.1', port=TCP_PORT):
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1077,4 +1404,5 @@ def cleanup_tasks():
 
 if __name__ == "__main__":
     threading.Thread(target=cleanup_tasks, daemon=True).start()
+    threading.Thread(target=start_key_exchange_server, daemon=True).start()
     threading.Thread(target=start_tcp_server).start()
