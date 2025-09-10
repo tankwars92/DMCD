@@ -30,7 +30,7 @@ except ImportError:
 
 # Change this!
 MY_SERVER_HOST = "example.com"
-TCP_PORT = 424239
+TCP_PORT = 42439
 ENCRYPTED_PORT = 42440
 ADMIN_USERNAME = "ADMIN"
 
