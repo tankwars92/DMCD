@@ -737,8 +737,11 @@ def deliver_remote_pm(sender, recipient, message, server_host=None, from_host=No
         return False
     delivered_any = False
     for sess in recipient_sessions:
-        ok = sess.send_text(pm_text)
-        delivered_any = delivered_any or ok
+        client_key = get_client_encryption_key(sess)
+        if client_key:
+            ok = send_to_client(sess.client_socket, pm_text, client_key)
+        else:
+            ok = sess.send_text(pm_text)
     if delivered_any:
         log_message(f"[remote_pm] Sucessfully sent to {recipient} ({len(recipient_sessions)} sessions)")
     else:
