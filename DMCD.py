@@ -29,10 +29,10 @@ except ImportError:
         sys.exit(1)
 
 # Change this!
-MY_SERVER_HOST = "dmconnect.hoho.ws"
-TCP_PORT = 1111
+MY_SERVER_HOST = "example.com"
+TCP_PORT = 424239
 ENCRYPTED_PORT = 42440
-ADMIN_USERNAME = "BitByByte"
+ADMIN_USERNAME = "ADMIN"
 
 AES_KEY_SIZE = 32
 IV_SIZE = 16
