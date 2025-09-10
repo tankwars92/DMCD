@@ -29,10 +29,10 @@ except ImportError:
         sys.exit(1)
 
 # Change this!
-MY_SERVER_HOST = "example.com"
-TCP_PORT = 42439
+MY_SERVER_HOST = "dmconnect.hoho.ws"
+TCP_PORT = 1111
 ENCRYPTED_PORT = 42440
-ADMIN_USERNAME = "ADMIN"
+ADMIN_USERNAME = "BitByByte"
 
 AES_KEY_SIZE = 32
 IV_SIZE = 16
@@ -218,7 +218,7 @@ def handle_key_exchange(client_socket, client_address):
 
         client_keys.pop(client_address, None)
 
-def start_key_exchange_server(host='0.0.0.0', port=ENCRYPTED_PORT):
+def start_key_exchange_server(host='127.0.0.1', port=ENCRYPTED_PORT):
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.bind((host, port))
     server_socket.listen(5)
@@ -742,6 +742,7 @@ def deliver_remote_pm(sender, recipient, message, server_host=None, from_host=No
             ok = send_to_client(sess.client_socket, pm_text, client_key)
         else:
             ok = sess.send_text(pm_text)
+        delivered_any = delivered_any or ok
     if delivered_any:
         log_message(f"[remote_pm] Sucessfully sent to {recipient} ({len(recipient_sessions)} sessions)")
     else:
@@ -837,11 +838,11 @@ def handle_client(client_socket, client_address):
                                         def _deliver_pm():
                                             return deliver_remote_pm(sender, recipient, message, server_host=client_addr, from_host=from_host)
                                         
-                                        delivered = send_with_retry(_deliver_pm)
-                                        if delivered:
-                                            sock.send((json.dumps({'status': 'ok'}) + '\n').encode('utf-8'))
-                                        else:
-                                            sock.send((json.dumps({'status': 'error', 'reason': 'User not online'}) + '\n').encode('utf-8'))
+                                        delivered = _deliver_pm()
+                                        if not delivered:
+                                            send_with_retry(_deliver_pm)
+                                        
+                                        sock.send((json.dumps({'status': 'ok'}) + '\n').encode('utf-8'))
                                     else:
                                         sock.send((json.dumps({'status': 'error', 'reason': 'Dialback failed'}) + '\n').encode('utf-8'))
                                     
@@ -1355,7 +1356,7 @@ def handle_client(client_socket, client_address):
         log_message(f"TCP client {client_address} disconnected")
 
 
-def start_tcp_server(host='0.0.0.0', port=TCP_PORT):
+def start_tcp_server(host='127.0.0.1', port=TCP_PORT):
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.bind((host, port))
     server_socket.listen(5)
