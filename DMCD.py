@@ -218,7 +218,7 @@ def handle_key_exchange(client_socket, client_address):
 
         client_keys.pop(client_address, None)
 
-def start_key_exchange_server(host='127.0.0.1', port=ENCRYPTED_PORT):
+def start_key_exchange_server(host='0.0.0.0', port=ENCRYPTED_PORT):
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.bind((host, port))
     server_socket.listen(5)
@@ -708,17 +708,11 @@ def _send_remote_private_message_sync(sender, recipient, host, message):
                 response += chunk
             try:
                 resp_json = json.loads(response.decode('utf-8').strip())
-                if resp_json.get('status') == 'ok':
-                    return True
-                else:
-                    log_message(f"[remote_pm] Server response: {resp_json}")
-                    return False
+                return resp_json
             except Exception as e:
-                log_message(f"[remote_pm] Error parsing response: {e}")
-                return False
+                return {'status': 'error', 'reason': 'parse_error'}
     except Exception as e:
-        log_message(f"[remove_pm] Sending error: {e}")
-        return False
+        return {'status': 'error', 'reason': 'network_error'}
 
 async def send_remote_private_message(sender, recipient, host, message):
     return await asyncio.to_thread(_send_remote_private_message_sync, sender, recipient, host, message)
@@ -759,8 +753,18 @@ def notify_tcp_result(client_socket, result, recipient, client_key=None):
         pass
 
 def handle_remote_pm_tcp(sender, recipient, host, private_message, client_socket, recipient_display, client_key=None):
-    result = _send_remote_private_message_sync(sender, recipient, host, private_message)
-    notify_tcp_result(client_socket, result, recipient_display, client_key)
+    resp = _send_remote_private_message_sync(sender, recipient, host, private_message)
+    status = False
+    if isinstance(resp, dict):
+        if resp.get('status') == 'ok':
+            status = True
+        elif resp.get('status') == 'error' and resp.get('reason') == 'user_not_found':
+            try:
+                send_to_client(client_socket, "User does not exist.", client_key)
+            except Exception:
+                pass
+            return
+    notify_tcp_result(client_socket, status, recipient_display, client_key)
 
 def send_to_client(client_socket, message, client_key=None):
     try:
@@ -835,14 +839,17 @@ def handle_client(client_socket, client_address):
                                     sender, recipient, message, sock = pending_dialback.pop(msg_id)
                                     
                                     if dialback_ok:
-                                        def _deliver_pm():
-                                            return deliver_remote_pm(sender, recipient, message, server_host=client_addr, from_host=from_host)
-                                        
-                                        delivered = _deliver_pm()
-                                        if not delivered:
-                                            send_with_retry(_deliver_pm)
-                                        
-                                        sock.send((json.dumps({'status': 'ok'}) + '\n').encode('utf-8'))
+                                        if recipient not in users:
+                                            sock.send((json.dumps({'status': 'error', 'reason': 'user_not_found'}) + '\n').encode('utf-8'))
+                                        else:
+                                            def _deliver_pm():
+                                                return deliver_remote_pm(sender, recipient, message, server_host=client_addr, from_host=from_host)
+
+                                            delivered = _deliver_pm()
+                                            if delivered:
+                                                sock.send((json.dumps({'status': 'ok'}) + '\n').encode('utf-8'))
+                                            else:
+                                                sock.send((json.dumps({'status': 'error', 'reason': 'failed'}) + '\n').encode('utf-8'))
                                     else:
                                         sock.send((json.dumps({'status': 'error', 'reason': 'Dialback failed'}) + '\n').encode('utf-8'))
                                     
@@ -1356,7 +1363,7 @@ def handle_client(client_socket, client_address):
         log_message(f"TCP client {client_address} disconnected")
 
 
-def start_tcp_server(host='127.0.0.1', port=TCP_PORT):
+def start_tcp_server(host='0.0.0.0', port=TCP_PORT):
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.bind((host, port))
     server_socket.listen(5)
