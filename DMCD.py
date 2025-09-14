@@ -1320,10 +1320,9 @@ def handle_client(client_socket, client_address):
                     if s in server_sessions:
                         server_sessions.remove(s)
 
-                    still_has = any(sess.username == s.username for sess in server_sessions)
-                    if not still_has:
-                        if '@' not in s.server_name:
-
+                    if '@' not in s.server_name:
+                        still_has = any(sess.username == s.username for sess in server_sessions)
+                        if not still_has:
                             members = servers.get(s.server_name, [])
                             if s.username in members:
                                 members.remove(s.username)
@@ -1334,23 +1333,23 @@ def handle_client(client_socket, client_address):
                             last = _authoritative_room_remove_member(s.server_name, s.username, MY_SERVER_HOST)
                             if last:
                                 _send_room_event_to_remotes(s.server_name, 'left', s.username, MY_SERVER_HOST)
-                        else:
-                            try:
-                                room_name, host_part = s.server_name.split('@', 1)
-                                key = (s.username, room_name, host_part)
-                                prev = user_remote_counters.get(key, 0)
-                                if prev > 1:
-                                    user_remote_counters[key] = prev - 1
-                                else:
-                                    user_remote_counters.pop(key, None)
-                                    payload = {
-                                        'type': 'room_leave',
-                                        'room': room_name,
-                                        'sender': s.username
-                                    }
-                                    send_remote_room_message(host_part, room_name, payload)
-                            except Exception:
-                                pass
+                    else:
+                        try:
+                            room_name, host_part = s.server_name.split('@', 1)
+                            key = (s.username, room_name, host_part)
+                            prev = user_remote_counters.get(key, 0)
+                            if prev > 1:
+                                user_remote_counters[key] = prev - 1
+                            else:
+                                user_remote_counters.pop(key, None)
+                                payload = {
+                                    'type': 'room_leave',
+                                    'room': room_name,
+                                    'sender': s.username
+                                }
+                                send_remote_room_message(host_part, room_name, payload)
+                        except Exception:
+                            pass
         finally:
             try:
                 client_socket.close()
