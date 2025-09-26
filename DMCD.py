@@ -49,6 +49,14 @@ _send_queues = {}
 _send_workers = {}
 _send_state_lock = threading.RLock()
 
+DELAYED_MESSAGE_TYPES = {
+    'chat_message',     
+    'private_message', 
+    'action_message',    
+    'broadcast_message', 
+    'room_event'        
+}
+
 def _send_worker(sock: socket.socket, q: 'queue.Queue[tuple[str, object]]'):
     last_sent_at = 0.0
     while True:
@@ -93,8 +101,27 @@ def _send_worker(sock: socket.socket, q: 'queue.Queue[tuple[str, object]]'):
             except Exception:
                 pass
 
-def enqueue_send(sock: socket.socket, message: str, client_key=None) -> bool:
+def _send_immediate(sock: socket.socket, message: str, client_key=None) -> bool:
     try:
+        if client_key:
+            if isinstance(client_key, tuple):
+                enc_key, mac_key = client_key
+            else:
+                enc_key, mac_key = client_key, None
+            return send_encrypted_message(sock, message, enc_key, mac_key)
+        else:
+            if not message.endswith('\n'):
+                message += '\n'
+            sock.send(message.encode('utf-8'))
+            return True
+    except Exception as e:
+        log_message(f"Error sending to client: {e}")
+        return False
+
+def enqueue_send(sock: socket.socket, message: str, client_key=None, message_type: str = 'system') -> bool:
+    try:
+        if message_type not in DELAYED_MESSAGE_TYPES:
+            return _send_immediate(sock, message, client_key)
         with _send_state_lock:
             q = _send_queues.get(sock)
             if q is None:
@@ -111,14 +138,13 @@ def enqueue_send(sock: socket.socket, message: str, client_key=None) -> bool:
         log_message(f"enqueue_send error: {e}")
         return False
 
-_recv_buffers = {}
-_recv_buffers_lock = threading.RLock()
-
 os.makedirs(servers_dir, exist_ok=True)
 
 def log_message(message):
     current_time = time.strftime("%H:%M:%S", time.localtime())
     print(f"[{current_time}] {message}")
+
+    
 
 def derive_session_keys(shared_bytes):
     try:
@@ -441,18 +467,7 @@ def format_room_event_text(viewer_host: str, event: str, username: str, origin_h
         return f"*** {disp} has left the server."
     if event == 'message':
         text = payload.get('text') if payload else ''
-        if '\n' in text:
-            lines = text.split('\n')
-            formatted_lines = []
-            for i, line in enumerate(lines):
-                if line.strip():
-                    if i == 0:
-                        formatted_lines.append(f"{disp}: {line}")
-                    else:
-                        formatted_lines.append(f"{' ' * len(disp)}: {line}")
-            return '\n'.join(formatted_lines)
-        else:
-            return f"{disp}: {text}"
+        return f"{disp}: {text}"
     if event == 'act':
         act = payload.get('act') if payload else ''
         return f"*** {disp} {act}"
@@ -489,8 +504,6 @@ def _update_remote_subscriber_count(room: str, origin_host: str):
 dialback_cache = {}
 DIALBACK_CACHE_TTL = 300
 
-connection_pool = {}
-CONNECTION_POOL_MAX_AGE = 60
 pending_dialback = {}
 
 def get_cached_dialback_result(host, msg_type):
@@ -507,74 +520,42 @@ def cache_dialback_result(host, msg_type, result):
     cache_key = f"{host}:{msg_type}"
     dialback_cache[cache_key] = (time.time(), result)
 
-def cleanup_connection_pool():
-    current_time = time.time()
-    to_remove = []
-    for host, (socket_obj, timestamp) in connection_pool.items():
-        if current_time - timestamp > CONNECTION_POOL_MAX_AGE:
-            try:
-                socket_obj.close()
-            except:
-                pass
-            to_remove.append(host)
-    for host in to_remove:
-        del connection_pool[host]
 
-def get_pooled_connection(host, port):
-    cleanup_connection_pool()
-    pool_key = f"{host}:{port}"
-    
-    if pool_key in connection_pool:
-        socket_obj, timestamp = connection_pool[pool_key]
-        try:
-            socket_obj.settimeout(0.1)
-            socket_obj.recv(1, socket.MSG_PEEK)
-            return socket_obj
-        except:
-            del connection_pool[pool_key]
-    
-    try:
-        new_socket = socket.create_connection((host, port), timeout=3)
-        connection_pool[pool_key] = (new_socket, time.time())
-        return new_socket
-    except Exception as e:
-        return None
 
-def send_with_pooled_connection(host, port, data, timeout=3):
-    sock = get_pooled_connection(host, port)
-    if not sock:
-        return None
-    
-    try:
-        sock.settimeout(timeout)
-        sock.sendall((json.dumps(data) + '\n').encode('utf-8'))
-        
-        response = b''
-        while not response.endswith(b'\n'):
-            chunk = sock.recv(4096)
-            if not chunk:
-                break
-            response += chunk
-        
-        if response:
-            return json.loads(response.decode('utf-8').strip())
-        return None
-    except Exception as e:
-        log_message(f"Error sending through pooled connection: {e}")
-        pool_key = f"{host}:{port}"
-        if pool_key in connection_pool:
-            del connection_pool[pool_key]
-        return None
+ 
+
+MAX_RETRIES = 3
+RETRY_DELAY = 1
 
 def send_with_retry(func, *args, **kwargs):
     try:
-        return func(*args, **kwargs)
+        result = func(*args, **kwargs)
+        if result is not None:
+            return result
     except Exception as e:
         if "timed out" in str(e) or "timeout" in str(e):
             log_message(f"[retry] Timeout: {e}")
         else:
             log_message(f"[retry] Error: {e}")
-        return None
+            return None
+    
+    def _retry_worker():
+        for attempt in range(1, MAX_RETRIES):
+            try:
+                time.sleep(RETRY_DELAY)
+                result = func(*args, **kwargs)
+                if result is not None:
+                    log_message(f"[retry] Sucessfully after {attempt + 1} attempts")
+                    return
+            except Exception as e:
+                if "timed out" in str(e) or "timeout" in str(e):
+                    log_message(f"[retry] Attempt {attempt + 1}/{MAX_RETRIES} timeout: {e}")
+                else:
+                    log_message(f"[retry] Error: {e}")
+                    break
+    
+    threading.Thread(target=_retry_worker, daemon=True).start()
+    return None
 
 def send_dialback_check(from_host, msg_id, msg_type, **kwargs):
     cached_result = get_cached_dialback_result(from_host, msg_type)
@@ -630,8 +611,8 @@ def _broadcast_room_event_locally(room: str, event: str, username: str, origin_h
     try:
         text = format_room_event_text(MY_SERVER_HOST, event, username, origin_host, payload)
         target_key = room_key or room
-        is_user_generated = event in ('message', 'act')
-        broadcast_message(text, target_key, user_generated=is_user_generated)
+        message_type = 'room_event' if event in ['message', 'act'] else 'system'
+        broadcast_message(text, target_key, message_type=message_type)
     except Exception as e:
         pass
 
@@ -661,45 +642,26 @@ class Session:
         self.client_socket = client_socket
         self.username = None
         self.server_name = None
+        self.protocol = 'tcp'
         self.created_at = time.time()
 
-    def send_text(self, message: str) -> bool:
-        return send_to_client(self.client_socket, message, None)
+    def send_text(self, message: str, message_type: str = 'system') -> bool:
+        return enqueue_send(self.client_socket, message, None, message_type)
     
-def broadcast_message(message, server_name, sender_session: 'Session' = None, user_generated: bool = False):
+def broadcast_message(message, server_name, sender_session: 'Session' = None, message_type: str = 'broadcast_message'):
     try:
         with session_lock:
             sessions = list(clients_by_server.get(server_name, set()))
 
-        if '\n' in message and user_generated:
-            lines = message.split('\n')
-            for line in lines:
-                if line.strip():
-                    for sess in sessions:
-                        if sender_session is not None and sess is sender_session:
-                            continue
-                        
-                        client_key = get_client_encryption_key(sess)
-                        if client_key:
-                            send_user_to_client(sess.client_socket, line, client_key)
-                        else:
-                            send_user_to_client(sess.client_socket, line, None)
-        else:
-            for sess in sessions:
-                if sender_session is not None and sess is sender_session:
-                    continue
-                
-                client_key = get_client_encryption_key(sess)
-                if user_generated:
-                    if client_key:
-                        send_user_to_client(sess.client_socket, message, client_key)
-                    else:
-                        send_user_to_client(sess.client_socket, message, None)
-                else:
-                    if client_key:
-                        send_to_client(sess.client_socket, message, client_key)
-                    else:
-                        sess.send_text(message)
+        for sess in sessions:
+            if sender_session is not None and sess is sender_session:
+                continue
+            
+            client_key = get_client_encryption_key(sess)
+            if client_key:
+                send_to_client(sess.client_socket, message, client_key, message_type)
+            else:
+                sess.send_text(message, message_type)
     except Exception as e:
         log_message(f"broadcast_message error: {e}")
 
@@ -708,28 +670,14 @@ def send_private_message(sender_username: str, recipient_username: str, message:
     delivered_any = False
     with session_lock:
         recipient_sessions = list(clients_by_user.get(recipient_username, set()))
-    
-    if '\n' in message:
-        lines = message.split('\n')
-        for line in lines:
-            if line.strip():
-                pm_text = f"(Private) {sender_username}: {line}"
-                for sess in recipient_sessions:
-                    client_key = get_client_encryption_key(sess)
-                    if client_key:
-                        ok = send_user_to_client(sess.client_socket, pm_text, client_key)
-                    else:
-                        ok = send_user_to_client(sess.client_socket, pm_text, None)
-                    delivered_any = delivered_any or ok
-    else:
-        pm_text = f"(Private) {sender_username}: {message}"
-        for sess in recipient_sessions:
-            client_key = get_client_encryption_key(sess)
-            if client_key:
-                ok = send_user_to_client(sess.client_socket, pm_text, client_key)
-            else:
-                ok = send_user_to_client(sess.client_socket, pm_text, None)
-            delivered_any = delivered_any or ok
+    pm_text = f"(Private) {sender_username}: {message}"
+    for sess in recipient_sessions:
+        client_key = get_client_encryption_key(sess)
+        if client_key:
+            ok = send_to_client(sess.client_socket, pm_text, client_key, 'private_message')
+        else:
+            ok = sess.send_text(pm_text, 'private_message')
+        delivered_any = delivered_any or ok
     return delivered_any
 
 def get_safe_server_path(server_name):
@@ -790,8 +738,7 @@ def _send_remote_private_message_sync(sender, recipient, host, message):
     except Exception as e:
         return {'status': 'error', 'reason': 'network_error'}
 
-async def send_remote_private_message(sender, recipient, host, message):
-    return await asyncio.to_thread(_send_remote_private_message_sync, sender, recipient, host, message)
+ 
 
 def deliver_remote_pm(sender, recipient, message, server_host=None, from_host=None):
     sender_display = sender
@@ -799,37 +746,20 @@ def deliver_remote_pm(sender, recipient, message, server_host=None, from_host=No
         sender_display = f"{sender}@{from_host}"
     elif server_host:
         sender_display = f"{sender}@{server_host}"
-    
+    pm_text = f"(Private) {sender_display}: {message}"
     with session_lock:
         recipient_sessions = list(clients_by_user.get(recipient, set()))
     if not recipient_sessions:
         log_message(f"[remote_pm] User {recipient} not found")
         return False
-    
     delivered_any = False
-    
-    if '\n' in message:
-        lines = message.split('\n')
-        for line in lines:
-            if line.strip():
-                pm_text = f"(Private) {sender_display}: {line}"
-                for sess in recipient_sessions:
-                    client_key = get_client_encryption_key(sess)
-                    if client_key:
-                        ok = send_user_to_client(sess.client_socket, pm_text, client_key)
-                    else:
-                        ok = send_user_to_client(sess.client_socket, pm_text, None)
-                    delivered_any = delivered_any or ok
-    else:
-        pm_text = f"(Private) {sender_display}: {message}"
-        for sess in recipient_sessions:
-            client_key = get_client_encryption_key(sess)
-            if client_key:
-                ok = send_user_to_client(sess.client_socket, pm_text, client_key)
-            else:
-                ok = send_user_to_client(sess.client_socket, pm_text, None)
-            delivered_any = delivered_any or ok
-    
+    for sess in recipient_sessions:
+        client_key = get_client_encryption_key(sess)
+        if client_key:
+            ok = send_to_client(sess.client_socket, pm_text, client_key, 'private_message')
+        else:
+            ok = sess.send_text(pm_text, 'private_message')
+        delivered_any = delivered_any or ok
     if delivered_any:
         log_message(f"[remote_pm] Sucessfully sent to {recipient} ({len(recipient_sessions)} sessions)")
     else:
@@ -859,28 +789,8 @@ def handle_remote_pm_tcp(sender, recipient, host, private_message, client_socket
             return
     notify_tcp_result(client_socket, status, recipient_display, client_key)
 
-def _send_immediate(client_socket, message, client_key=None):
-    try:
-        if client_key:
-            if isinstance(client_key, tuple):
-                enc_key, mac_key = client_key
-            else:
-                enc_key, mac_key = client_key, None
-            return send_encrypted_message(client_socket, message, enc_key, mac_key)
-        else:
-            if not message.endswith('\n'):
-                message += '\n'
-            client_socket.send(message.encode('utf-8'))
-            return True
-    except Exception as e:
-        log_message(f"Error sending to client: {e}")
-        return False
-
-def send_to_client(client_socket, message, client_key=None):
-    return _send_immediate(client_socket, message, client_key)
-
-def send_user_to_client(client_socket, message, client_key=None):
-    return enqueue_send(client_socket, message, client_key)
+def send_to_client(client_socket, message, client_key=None, message_type: str = 'system'):
+    return enqueue_send(client_socket, message, client_key, message_type)
 
 def receive_from_client(client_socket, client_key=None):
     try:
@@ -891,64 +801,11 @@ def receive_from_client(client_socket, client_key=None):
                 enc_key, mac_key = client_key, None
             return receive_encrypted_message(client_socket, enc_key, mac_key)
         else:
-            with _recv_buffers_lock:
-                buf = _recv_buffers.get(client_socket, '')
-
-            if '\n' in buf:
-                line, rest = buf.split('\n', 1)
-                with _recv_buffers_lock:
-                    _recv_buffers[client_socket] = rest
-
-                line = line.strip()
-
-                if line.startswith("/pm "):
-                    pm_lines = [line]
-                    while '\n' in rest:
-                        nxt, rest = rest.split('\n', 1)
-                        pm_lines.append(nxt.strip())
-                    with _recv_buffers_lock:
-                        _recv_buffers[client_socket] = rest
-                    return "\n".join(pm_lines)
-
-                return line
-
-            if buf:
-                with _recv_buffers_lock:
-                    _recv_buffers[client_socket] = ''
-                return buf.strip()
-
-            chunk = client_socket.recv(4096)
-            if not chunk:
-                return None
-            try:
-                text = chunk.decode('utf-8')
-            except Exception:
-                text = chunk.decode('utf-8', errors='ignore')
-
-            if '\n' in text:
-                line, rest = text.split('\n', 1)
-                with _recv_buffers_lock:
-                    _recv_buffers[client_socket] = rest
-
-                line = line.strip()
-
-                if line.startswith("/pm "):
-                    pm_lines = [line]
-                    while '\n' in rest:
-                        nxt, rest = rest.split('\n', 1)
-                        pm_lines.append(nxt.strip())
-                    with _recv_buffers_lock:
-                        _recv_buffers[client_socket] = rest
-                    return "\n".join(pm_lines)
-
-                return line
-            else:
-                return text.strip()
-
+            data = client_socket.recv(1024).decode('utf-8').strip()
+            return data if data else None
     except Exception as e:
         log_message(f"Error receiving from client: {e}")
         return None
-
 
 def handle_client(client_socket, client_address):
     global last_cmd
@@ -1402,7 +1259,7 @@ def handle_client(client_socket, client_address):
                         }
                         send_remote_room_message(host_part, room_name, payload)
                     else:
-                        broadcast_message(f"*** {logged_in_user} {act_name}", user_server, user_generated=True)
+                        broadcast_message(f"*** {logged_in_user} {act_name}", user_server, message_type='action_message')
                         _send_room_event_to_remotes(room_name, 'act', logged_in_user, MY_SERVER_HOST, {'act': act_name})
                 elif message.startswith("/pm"):
                     parts = message.split(" ", 2)
@@ -1413,21 +1270,6 @@ def handle_client(client_socket, client_address):
                     m = re.match(r"^([\w\-]+)@([\w\.-]+)$", recipient)
                     if m:
                         remote_user, remote_host = m.group(1), m.group(2)
-
-                        if remote_host == MY_SERVER_HOST:
-                            if remote_user not in users:
-                                send_to_client(client_socket, "User does not exist.", client_key)
-                                continue
-                            if remote_user == logged_in_user:
-                                send_to_client(client_socket, "You cannot send private messages to yourself.", client_key)
-                                continue
-                            if remote_user in bans:
-                                send_to_client(client_socket, f"{remote_user} is banned.", client_key)
-                                continue
-                            result = send_private_message(logged_in_user, remote_user, private_message)
-                            notify_tcp_result(client_socket, result, remote_user, client_key)
-                            continue
-
                         threading.Thread(target=handle_remote_pm_tcp, args=(logged_in_user, remote_user, remote_host, private_message, client_socket, recipient, client_key), daemon=True).start()
                         continue
                     if recipient not in users:
@@ -1463,7 +1305,7 @@ def handle_client(client_socket, client_address):
                         send_remote_room_message(host_part, room_name, payload)
                     else:
                         full_message = f"{logged_in_user}: {message}"
-                        broadcast_message(full_message, user_server, user_generated=True)
+                        broadcast_message(full_message, user_server, message_type='chat_message')
                         _send_room_event_to_remotes(room_name, 'message', logged_in_user, MY_SERVER_HOST, {'text': message})
     except Exception as e:
         log_message(f"TCP client {client_address} error: {e}")
@@ -1523,12 +1365,6 @@ def handle_client(client_socket, client_address):
             except Exception:
                 pass
             client_keys.pop(client_address, None)
-            try:
-                with _recv_buffers_lock:
-                    _recv_buffers.pop(client_socket, None)
-            except Exception:
-                pass
-
             try:
                 with _send_state_lock:
                     q = _send_queues.get(client_socket)
@@ -1596,8 +1432,6 @@ def _send_remote_room_sync(target_host: str, target_port: int, data: dict):
 def cleanup_tasks():
     while True:
         time.sleep(60)
-        cleanup_connection_pool()
-
         current_time = time.time()
         to_remove = []
         for key, (timestamp, result) in dialback_cache.items():
