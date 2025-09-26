@@ -441,7 +441,18 @@ def format_room_event_text(viewer_host: str, event: str, username: str, origin_h
         return f"*** {disp} has left the server."
     if event == 'message':
         text = payload.get('text') if payload else ''
-        return f"{disp}: {text}"
+        if '\n' in text:
+            lines = text.split('\n')
+            formatted_lines = []
+            for i, line in enumerate(lines):
+                if line.strip():
+                    if i == 0:
+                        formatted_lines.append(f"{disp}: {line}")
+                    else:
+                        formatted_lines.append(f"{' ' * len(disp)}: {line}")
+            return '\n'.join(formatted_lines)
+        else:
+            return f"{disp}: {text}"
     if event == 'act':
         act = payload.get('act') if payload else ''
         return f"*** {disp} {act}"
@@ -660,21 +671,35 @@ def broadcast_message(message, server_name, sender_session: 'Session' = None, us
         with session_lock:
             sessions = list(clients_by_server.get(server_name, set()))
 
-        for sess in sessions:
-            if sender_session is not None and sess is sender_session:
-                continue
-            
-            client_key = get_client_encryption_key(sess)
-            if user_generated:
-                if client_key:
-                    send_user_to_client(sess.client_socket, message, client_key)
+        if '\n' in message and user_generated:
+            lines = message.split('\n')
+            for line in lines:
+                if line.strip():
+                    for sess in sessions:
+                        if sender_session is not None and sess is sender_session:
+                            continue
+                        
+                        client_key = get_client_encryption_key(sess)
+                        if client_key:
+                            send_user_to_client(sess.client_socket, line, client_key)
+                        else:
+                            send_user_to_client(sess.client_socket, line, None)
+        else:
+            for sess in sessions:
+                if sender_session is not None and sess is sender_session:
+                    continue
+                
+                client_key = get_client_encryption_key(sess)
+                if user_generated:
+                    if client_key:
+                        send_user_to_client(sess.client_socket, message, client_key)
+                    else:
+                        send_user_to_client(sess.client_socket, message, None)
                 else:
-                    send_user_to_client(sess.client_socket, message, None)
-            else:
-                if client_key:
-                    send_to_client(sess.client_socket, message, client_key)
-                else:
-                    sess.send_text(message)
+                    if client_key:
+                        send_to_client(sess.client_socket, message, client_key)
+                    else:
+                        sess.send_text(message)
     except Exception as e:
         log_message(f"broadcast_message error: {e}")
 
@@ -683,14 +708,28 @@ def send_private_message(sender_username: str, recipient_username: str, message:
     delivered_any = False
     with session_lock:
         recipient_sessions = list(clients_by_user.get(recipient_username, set()))
-    pm_text = f"(Private) {sender_username}: {message}"
-    for sess in recipient_sessions:
-        client_key = get_client_encryption_key(sess)
-        if client_key:
-            ok = send_user_to_client(sess.client_socket, pm_text, client_key)
-        else:
-            ok = send_user_to_client(sess.client_socket, pm_text, None)
-        delivered_any = delivered_any or ok
+    
+    if '\n' in message:
+        lines = message.split('\n')
+        for line in lines:
+            if line.strip():
+                pm_text = f"(Private) {sender_username}: {line}"
+                for sess in recipient_sessions:
+                    client_key = get_client_encryption_key(sess)
+                    if client_key:
+                        ok = send_user_to_client(sess.client_socket, pm_text, client_key)
+                    else:
+                        ok = send_user_to_client(sess.client_socket, pm_text, None)
+                    delivered_any = delivered_any or ok
+    else:
+        pm_text = f"(Private) {sender_username}: {message}"
+        for sess in recipient_sessions:
+            client_key = get_client_encryption_key(sess)
+            if client_key:
+                ok = send_user_to_client(sess.client_socket, pm_text, client_key)
+            else:
+                ok = send_user_to_client(sess.client_socket, pm_text, None)
+            delivered_any = delivered_any or ok
     return delivered_any
 
 def get_safe_server_path(server_name):
@@ -760,20 +799,37 @@ def deliver_remote_pm(sender, recipient, message, server_host=None, from_host=No
         sender_display = f"{sender}@{from_host}"
     elif server_host:
         sender_display = f"{sender}@{server_host}"
-    pm_text = f"(Private) {sender_display}: {message}"
+    
     with session_lock:
         recipient_sessions = list(clients_by_user.get(recipient, set()))
     if not recipient_sessions:
         log_message(f"[remote_pm] User {recipient} not found")
         return False
+    
     delivered_any = False
-    for sess in recipient_sessions:
-        client_key = get_client_encryption_key(sess)
-        if client_key:
-            ok = send_user_to_client(sess.client_socket, pm_text, client_key)
-        else:
-            ok = send_user_to_client(sess.client_socket, pm_text, None)
-        delivered_any = delivered_any or ok
+    
+    if '\n' in message:
+        lines = message.split('\n')
+        for line in lines:
+            if line.strip():
+                pm_text = f"(Private) {sender_display}: {line}"
+                for sess in recipient_sessions:
+                    client_key = get_client_encryption_key(sess)
+                    if client_key:
+                        ok = send_user_to_client(sess.client_socket, pm_text, client_key)
+                    else:
+                        ok = send_user_to_client(sess.client_socket, pm_text, None)
+                    delivered_any = delivered_any or ok
+    else:
+        pm_text = f"(Private) {sender_display}: {message}"
+        for sess in recipient_sessions:
+            client_key = get_client_encryption_key(sess)
+            if client_key:
+                ok = send_user_to_client(sess.client_socket, pm_text, client_key)
+            else:
+                ok = send_user_to_client(sess.client_socket, pm_text, None)
+            delivered_any = delivered_any or ok
+    
     if delivered_any:
         log_message(f"[remote_pm] Sucessfully sent to {recipient} ({len(recipient_sessions)} sessions)")
     else:
@@ -837,11 +893,25 @@ def receive_from_client(client_socket, client_key=None):
         else:
             with _recv_buffers_lock:
                 buf = _recv_buffers.get(client_socket, '')
+
             if '\n' in buf:
                 line, rest = buf.split('\n', 1)
                 with _recv_buffers_lock:
                     _recv_buffers[client_socket] = rest
-                return line.strip()
+
+                line = line.strip()
+
+                if line.startswith("/pm "):
+                    pm_lines = [line]
+                    while '\n' in rest:
+                        nxt, rest = rest.split('\n', 1)
+                        pm_lines.append(nxt.strip())
+                    with _recv_buffers_lock:
+                        _recv_buffers[client_socket] = rest
+                    return "\n".join(pm_lines)
+
+                return line
+
             if buf:
                 with _recv_buffers_lock:
                     _recv_buffers[client_socket] = ''
@@ -859,12 +929,26 @@ def receive_from_client(client_socket, client_key=None):
                 line, rest = text.split('\n', 1)
                 with _recv_buffers_lock:
                     _recv_buffers[client_socket] = rest
-                return line.strip()
+
+                line = line.strip()
+
+                if line.startswith("/pm "):
+                    pm_lines = [line]
+                    while '\n' in rest:
+                        nxt, rest = rest.split('\n', 1)
+                        pm_lines.append(nxt.strip())
+                    with _recv_buffers_lock:
+                        _recv_buffers[client_socket] = rest
+                    return "\n".join(pm_lines)
+
+                return line
             else:
                 return text.strip()
+
     except Exception as e:
         log_message(f"Error receiving from client: {e}")
         return None
+
 
 def handle_client(client_socket, client_address):
     global last_cmd
