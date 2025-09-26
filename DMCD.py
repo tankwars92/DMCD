@@ -9,18 +9,15 @@ import hashlib
 import base64
 import random
 import struct
+import queue
 
 try:
     from Crypto.Cipher import AES
     from Crypto.Random import get_random_bytes
-    from Crypto.PublicKey import RSA
-    from Crypto.Cipher import PKCS1_OAEP
 except ImportError:
     try:
         from Cryptodome.Cipher import AES
         from Cryptodome.Random import get_random_bytes
-        from Cryptodome.PublicKey import RSA
-        from Cryptodome.Cipher import PKCS1_OAEP
     except ImportError:
         import sys
         sys.stderr.write(
@@ -34,7 +31,6 @@ TCP_PORT = 42439
 ENCRYPTED_PORT = 42440
 ADMIN_USERNAME = "ADMIN"
 
-AES_KEY_SIZE = 32
 IV_SIZE = 16
 
 users_file = 'users.json'
@@ -48,14 +44,81 @@ client_keys = {}
 
 session_lock = threading.RLock()
 
+SEND_DELAY_SECONDS = 0.15
+_send_queues = {}
+_send_workers = {}
+_send_state_lock = threading.RLock()
+
+def _send_worker(sock: socket.socket, q: 'queue.Queue[tuple[str, object]]'):
+    last_sent_at = 0.0
+    while True:
+        try:
+            item = q.get()
+            if item is None:
+                break
+            message, client_key = item
+            now = time.time()
+            delta = now - last_sent_at
+            if SEND_DELAY_SECONDS > 0 and delta < SEND_DELAY_SECONDS:
+                time.sleep(SEND_DELAY_SECONDS - delta)
+
+            try:
+                if client_key:
+                    if isinstance(client_key, tuple):
+                        enc_key, mac_key = client_key
+                    else:
+                        enc_key, mac_key = client_key, None
+                    send_encrypted_message(sock, message, enc_key, mac_key)
+                else:
+                    if not message.endswith('\n'):
+                        message_to_send = message + '\n'
+                    else:
+                        message_to_send = message
+                    sock.send(message_to_send.encode('utf-8'))
+            except Exception as e:
+                log_message(f"Error sending to client: {e}")
+                break
+
+            last_sent_at = time.time()
+        except Exception:
+            break
+
+    with _send_state_lock:
+        _send_workers.pop(sock, None)
+        q_local = _send_queues.pop(sock, None)
+        if q_local is not None:
+            try:
+                while not q_local.empty():
+                    q_local.get_nowait()
+            except Exception:
+                pass
+
+def enqueue_send(sock: socket.socket, message: str, client_key=None) -> bool:
+    try:
+        with _send_state_lock:
+            q = _send_queues.get(sock)
+            if q is None:
+                q = queue.Queue()
+                _send_queues[sock] = q
+            worker = _send_workers.get(sock)
+            if worker is None or not worker.is_alive():
+                worker = threading.Thread(target=_send_worker, args=(sock, q), daemon=True)
+                _send_workers[sock] = worker
+                worker.start()
+        q.put((message, client_key))
+        return True
+    except Exception as e:
+        log_message(f"enqueue_send error: {e}")
+        return False
+
+_recv_buffers = {}
+_recv_buffers_lock = threading.RLock()
+
 os.makedirs(servers_dir, exist_ok=True)
 
 def log_message(message):
     current_time = time.strftime("%H:%M:%S", time.localtime())
     print(f"[{current_time}] {message}")
-
-def generate_aes_key():
-    return get_random_bytes(AES_KEY_SIZE)
 
 def derive_session_keys(shared_bytes):
     try:
@@ -492,38 +555,15 @@ def send_with_pooled_connection(host, port, data, timeout=3):
             del connection_pool[pool_key]
         return None
 
-MAX_RETRIES = 3
-RETRY_DELAY = 1
-
 def send_with_retry(func, *args, **kwargs):
     try:
-        result = func(*args, **kwargs)
-        if result is not None:
-            return result
+        return func(*args, **kwargs)
     except Exception as e:
         if "timed out" in str(e) or "timeout" in str(e):
             log_message(f"[retry] Timeout: {e}")
         else:
             log_message(f"[retry] Error: {e}")
-            return None
-    
-    def _retry_worker():
-        for attempt in range(1, MAX_RETRIES):
-            try:
-                time.sleep(RETRY_DELAY)
-                result = func(*args, **kwargs)
-                if result is not None:
-                    log_message(f"[retry] Sucessfully after {attempt + 1} attempts")
-                    return
-            except Exception as e:
-                if "timed out" in str(e) or "timeout" in str(e):
-                    log_message(f"[retry] Attempt {attempt + 1}/{MAX_RETRIES} timeout: {e}")
-                else:
-                    log_message(f"[retry] Error: {e}")
-                    break
-    
-    threading.Thread(target=_retry_worker, daemon=True).start()
-    return None
+        return None
 
 def send_dialback_check(from_host, msg_id, msg_type, **kwargs):
     cached_result = get_cached_dialback_result(from_host, msg_type)
@@ -579,7 +619,8 @@ def _broadcast_room_event_locally(room: str, event: str, username: str, origin_h
     try:
         text = format_room_event_text(MY_SERVER_HOST, event, username, origin_host, payload)
         target_key = room_key or room
-        broadcast_message(text, target_key)
+        is_user_generated = event in ('message', 'act')
+        broadcast_message(text, target_key, user_generated=is_user_generated)
     except Exception as e:
         pass
 
@@ -609,22 +650,12 @@ class Session:
         self.client_socket = client_socket
         self.username = None
         self.server_name = None
-        self.protocol = 'tcp'
         self.created_at = time.time()
 
     def send_text(self, message: str) -> bool:
-        try:
-            if not message.endswith('\n'):
-                payload = (message + '\n').encode('utf-8')
-            else:
-                payload = message.encode('utf-8')
-            self.client_socket.send(payload)
-            return True
-        except Exception as e:
-            log_message(f"Error sending to client ({self.username}): {e}")
-            return False
+        return send_to_client(self.client_socket, message, None)
     
-def broadcast_message(message, server_name, sender_session: 'Session' = None):
+def broadcast_message(message, server_name, sender_session: 'Session' = None, user_generated: bool = False):
     try:
         with session_lock:
             sessions = list(clients_by_server.get(server_name, set()))
@@ -634,10 +665,16 @@ def broadcast_message(message, server_name, sender_session: 'Session' = None):
                 continue
             
             client_key = get_client_encryption_key(sess)
-            if client_key:
-                send_to_client(sess.client_socket, message, client_key)
+            if user_generated:
+                if client_key:
+                    send_user_to_client(sess.client_socket, message, client_key)
+                else:
+                    send_user_to_client(sess.client_socket, message, None)
             else:
-                sess.send_text(message)
+                if client_key:
+                    send_to_client(sess.client_socket, message, client_key)
+                else:
+                    sess.send_text(message)
     except Exception as e:
         log_message(f"broadcast_message error: {e}")
 
@@ -650,9 +687,9 @@ def send_private_message(sender_username: str, recipient_username: str, message:
     for sess in recipient_sessions:
         client_key = get_client_encryption_key(sess)
         if client_key:
-            ok = send_to_client(sess.client_socket, pm_text, client_key)
+            ok = send_user_to_client(sess.client_socket, pm_text, client_key)
         else:
-            ok = sess.send_text(pm_text)
+            ok = send_user_to_client(sess.client_socket, pm_text, None)
         delivered_any = delivered_any or ok
     return delivered_any
 
@@ -733,9 +770,9 @@ def deliver_remote_pm(sender, recipient, message, server_host=None, from_host=No
     for sess in recipient_sessions:
         client_key = get_client_encryption_key(sess)
         if client_key:
-            ok = send_to_client(sess.client_socket, pm_text, client_key)
+            ok = send_user_to_client(sess.client_socket, pm_text, client_key)
         else:
-            ok = sess.send_text(pm_text)
+            ok = send_user_to_client(sess.client_socket, pm_text, None)
         delivered_any = delivered_any or ok
     if delivered_any:
         log_message(f"[remote_pm] Sucessfully sent to {recipient} ({len(recipient_sessions)} sessions)")
@@ -766,7 +803,7 @@ def handle_remote_pm_tcp(sender, recipient, host, private_message, client_socket
             return
     notify_tcp_result(client_socket, status, recipient_display, client_key)
 
-def send_to_client(client_socket, message, client_key=None):
+def _send_immediate(client_socket, message, client_key=None):
     try:
         if client_key:
             if isinstance(client_key, tuple):
@@ -783,6 +820,12 @@ def send_to_client(client_socket, message, client_key=None):
         log_message(f"Error sending to client: {e}")
         return False
 
+def send_to_client(client_socket, message, client_key=None):
+    return _send_immediate(client_socket, message, client_key)
+
+def send_user_to_client(client_socket, message, client_key=None):
+    return enqueue_send(client_socket, message, client_key)
+
 def receive_from_client(client_socket, client_key=None):
     try:
         if client_key:
@@ -792,8 +835,33 @@ def receive_from_client(client_socket, client_key=None):
                 enc_key, mac_key = client_key, None
             return receive_encrypted_message(client_socket, enc_key, mac_key)
         else:
-            data = client_socket.recv(1024).decode('utf-8').strip()
-            return data if data else None
+            with _recv_buffers_lock:
+                buf = _recv_buffers.get(client_socket, '')
+            if '\n' in buf:
+                line, rest = buf.split('\n', 1)
+                with _recv_buffers_lock:
+                    _recv_buffers[client_socket] = rest
+                return line.strip()
+            if buf:
+                with _recv_buffers_lock:
+                    _recv_buffers[client_socket] = ''
+                return buf.strip()
+
+            chunk = client_socket.recv(4096)
+            if not chunk:
+                return None
+            try:
+                text = chunk.decode('utf-8')
+            except Exception:
+                text = chunk.decode('utf-8', errors='ignore')
+
+            if '\n' in text:
+                line, rest = text.split('\n', 1)
+                with _recv_buffers_lock:
+                    _recv_buffers[client_socket] = rest
+                return line.strip()
+            else:
+                return text.strip()
     except Exception as e:
         log_message(f"Error receiving from client: {e}")
         return None
@@ -1250,7 +1318,7 @@ def handle_client(client_socket, client_address):
                         }
                         send_remote_room_message(host_part, room_name, payload)
                     else:
-                        broadcast_message(f"*** {logged_in_user} {act_name}", user_server)
+                        broadcast_message(f"*** {logged_in_user} {act_name}", user_server, user_generated=True)
                         _send_room_event_to_remotes(room_name, 'act', logged_in_user, MY_SERVER_HOST, {'act': act_name})
                 elif message.startswith("/pm"):
                     parts = message.split(" ", 2)
@@ -1261,6 +1329,21 @@ def handle_client(client_socket, client_address):
                     m = re.match(r"^([\w\-]+)@([\w\.-]+)$", recipient)
                     if m:
                         remote_user, remote_host = m.group(1), m.group(2)
+
+                        if remote_host == MY_SERVER_HOST:
+                            if remote_user not in users:
+                                send_to_client(client_socket, "User does not exist.", client_key)
+                                continue
+                            if remote_user == logged_in_user:
+                                send_to_client(client_socket, "You cannot send private messages to yourself.", client_key)
+                                continue
+                            if remote_user in bans:
+                                send_to_client(client_socket, f"{remote_user} is banned.", client_key)
+                                continue
+                            result = send_private_message(logged_in_user, remote_user, private_message)
+                            notify_tcp_result(client_socket, result, remote_user, client_key)
+                            continue
+
                         threading.Thread(target=handle_remote_pm_tcp, args=(logged_in_user, remote_user, remote_host, private_message, client_socket, recipient, client_key), daemon=True).start()
                         continue
                     if recipient not in users:
@@ -1296,7 +1379,7 @@ def handle_client(client_socket, client_address):
                         send_remote_room_message(host_part, room_name, payload)
                     else:
                         full_message = f"{logged_in_user}: {message}"
-                        broadcast_message(full_message, user_server)
+                        broadcast_message(full_message, user_server, user_generated=True)
                         _send_room_event_to_remotes(room_name, 'message', logged_in_user, MY_SERVER_HOST, {'text': message})
     except Exception as e:
         log_message(f"TCP client {client_address} error: {e}")
@@ -1356,6 +1439,25 @@ def handle_client(client_socket, client_address):
             except Exception:
                 pass
             client_keys.pop(client_address, None)
+            try:
+                with _recv_buffers_lock:
+                    _recv_buffers.pop(client_socket, None)
+            except Exception:
+                pass
+
+            try:
+                with _send_state_lock:
+                    q = _send_queues.get(client_socket)
+                if q is not None:
+                    try:
+                        q.put_nowait(None)
+                    except Exception:
+                        pass
+                with _send_state_lock:
+                    _send_queues.pop(client_socket, None)
+                    _send_workers.pop(client_socket, None)
+            except Exception:
+                pass
             if left_broadcast_needed:
                 u, srv = left_broadcast_needed
                 broadcast_message(f"*** {u} has left the server.", srv)
