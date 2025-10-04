@@ -32,6 +32,7 @@ ENCRYPTED_PORT = 42440
 ADMIN_USERNAME = "ADMIN"
 
 IV_SIZE = 16
+MAX_PACKET_SIZE = 32 * 1024
 
 users_file = 'users.json'
 bans_file = 'bans.json'
@@ -577,7 +578,7 @@ def send_dialback_check(from_host, msg_id, msg_type, **kwargs):
                 s.settimeout(5)
                 response = b''
                 while not response.endswith(b'\n'):
-                    chunk = s.recv(4096)
+                    chunk = s.recv(MAX_PACKET_SIZE)
                     if not chunk:
                         break
                     response += chunk
@@ -726,7 +727,7 @@ def _send_remote_private_message_sync(sender, recipient, host, message):
             s.settimeout(5)
             response = b''
             while not response.endswith(b'\n'):
-                chunk = s.recv(4096)
+                chunk = s.recv(MAX_PACKET_SIZE)
                 if not chunk:
                     break
                 response += chunk
@@ -801,7 +802,7 @@ def receive_from_client(client_socket, client_key=None):
                 enc_key, mac_key = client_key, None
             return receive_encrypted_message(client_socket, enc_key, mac_key)
         else:
-            data = client_socket.recv(1024).decode('utf-8').strip()
+            data = client_socket.recv(MAX_PACKET_SIZE).decode('utf-8').strip()
             return data if data else None
     except Exception as e:
         log_message(f"Error receiving from client: {e}")
@@ -823,12 +824,12 @@ def handle_client(client_socket, client_address):
     try:
         client_socket.settimeout(0.5)
         try:
-            peek = client_socket.recv(4096, socket.MSG_PEEK)
+            peek = client_socket.recv(MAX_PACKET_SIZE, socket.MSG_PEEK)
             if peek:
                 try:
                     msg = json.loads(peek.decode('utf-8').strip())
                     if msg.get('type') == 'remote_pm':
-                        data = client_socket.recv(4096)
+                        data = client_socket.recv(MAX_PACKET_SIZE)
                         msg = json.loads(data.decode('utf-8').strip())
                         from_host = msg.get('from_host')
                         msg_id = msg.get('msg_id')
@@ -877,14 +878,14 @@ def handle_client(client_socket, client_address):
                         threading.Thread(target=async_dialback_check, daemon=True).start()
                         return
                     elif msg.get('type') == 'dialback_check':
-                        data = client_socket.recv(4096)
+                        data = client_socket.recv(MAX_PACKET_SIZE)
                         msg = json.loads(data.decode('utf-8').strip())
                         resp = handle_dialback_check(msg)
                         client_socket.send((json.dumps(resp) + '\n').encode('utf-8'))
                         client_socket.close()
                         return
                     elif msg.get('type') in ('room_join','room_leave','room_message','room_act','room_members_request','room_event'):
-                        data = client_socket.recv(4096)
+                        data = client_socket.recv(MAX_PACKET_SIZE)
                         msg = json.loads(data.decode('utf-8').strip())
                         msg_type = msg.get('type')
                         from_host = msg.get('from_host')
@@ -1414,7 +1415,7 @@ def _send_remote_room_sync(target_host: str, target_port: int, data: dict):
                 s.settimeout(5)
                 response = b''
                 while not response.endswith(b'\n'):
-                    chunk = s.recv(4096)
+                    chunk = s.recv(MAX_PACKET_SIZE)
                     if not chunk:
                         break
                     response += chunk
