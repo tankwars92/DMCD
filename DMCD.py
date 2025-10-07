@@ -502,6 +502,23 @@ def _update_remote_subscriber_count(room: str, origin_host: str):
     else:
         subs.discard(origin_host)
 
+def _prune_unreachable_host_for_room(room: str, host: str):
+    try:
+        room_map = _room_members(room)
+        to_remove = [(u,h) for (u,h) in list(room_map.keys()) if h == host]
+        if not to_remove:
+            _remote_subscribers(room).discard(host)
+            return
+
+        for (username, origin_host) in to_remove:
+            _authoritative_room_remove_member(room, username, origin_host)
+            _broadcast_room_event_locally(room, 'left', username, origin_host)
+            
+        _remote_subscribers(room).discard(host)
+        log_message(f"Pruned unreachable host {host} from room {room} ({len(to_remove)} member(s) removed)")
+    except Exception as e:
+        log_message(f"_prune_unreachable_host_for_room error: {e}")
+
 dialback_cache = {}
 DIALBACK_CACHE_TTL = 300
 
@@ -598,7 +615,7 @@ def send_dialback_check(from_host, msg_id, msg_type, **kwargs):
     
     return send_with_retry(_send_dialback)
 
-def send_remote_room_message(host: str, room: str, payload: dict) -> dict | None:
+def send_remote_room_message(host: str, room: str, payload: dict, timeout_sec: float | None = None, use_retry: bool = True) -> dict | None:
     if host is None:
         return None
     data = {
@@ -606,7 +623,7 @@ def send_remote_room_message(host: str, room: str, payload: dict) -> dict | None
         'from_host': get_advertised_host(),
         **payload
     }
-    return _send_remote_room_sync(host, 42439, data)
+    return _send_remote_room_sync(host, 42439, data, timeout_sec=timeout_sec, use_retry=use_retry)
 
 def _broadcast_room_event_locally(room: str, event: str, username: str, origin_host: str, payload: dict | None = None, room_key: str | None = None):
     try:
@@ -633,9 +650,11 @@ def _send_room_event_to_remotes(room: str, event: str, username: str, origin_hos
             'payload': payload or {}
         }
         try:
-            send_remote_room_message(host, room, data)
+            resp = send_remote_room_message(host, room, data, timeout_sec=1.0, use_retry=False)
+            if not resp or resp.get('status') != 'ok':
+                _prune_unreachable_host_for_room(room, host)
         except Exception:
-            pass
+            _prune_unreachable_host_for_room(room, host)
 
 
 class Session:
@@ -643,7 +662,6 @@ class Session:
         self.client_socket = client_socket
         self.username = None
         self.server_name = None
-        self.protocol = 'tcp'
         self.created_at = time.time()
 
     def send_text(self, message: str, message_type: str = 'system') -> bool:
@@ -660,13 +678,133 @@ def broadcast_message(message, server_name, sender_session: 'Session' = None, me
             
             client_key = get_client_encryption_key(sess)
             if client_key:
-                send_to_client(sess.client_socket, message, client_key, message_type)
+                ok = send_to_client(sess.client_socket, message, client_key, message_type)
             else:
-                sess.send_text(message, message_type)
+                ok = sess.send_text(message, message_type)
+
+            if not ok:
+                try:
+                    _evict_unreachable_session(sess)
+                except Exception as _e:
+                    pass
     except Exception as e:
         log_message(f"broadcast_message error: {e}")
 
 
+def _evict_unreachable_session(s: 'Session'):
+    try:
+        username = getattr(s, 'username', None)
+        server_name = getattr(s, 'server_name', None)
+        if not server_name or not username:
+            try:
+                sock = getattr(s, 'client_socket', None)
+                if sock:
+                    try:
+                        with _send_state_lock:
+                            q = _send_queues.get(sock)
+                        if q is not None:
+                            try:
+                                q.put_nowait(None)
+                            except Exception:
+                                pass
+                        with _send_state_lock:
+                            _send_queues.pop(sock, None)
+                            _send_workers.pop(sock, None)
+                    except Exception:
+                        pass
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+            finally:
+                return
+
+        left_broadcast_needed = None
+        should_send_remote_leave = False
+        remote_leave_payload = None
+
+        with session_lock:
+            user_sessions = clients_by_user.get(username, set())
+            if s in user_sessions:
+                user_sessions.remove(s)
+            if not user_sessions:
+                clients_by_user.pop(username, None)
+
+            server_sessions = clients_by_server.get(server_name, set())
+            if s in server_sessions:
+                server_sessions.remove(s)
+
+            if '@' not in server_name:
+                still_has = any(sess.username == username for sess in server_sessions)
+                if not still_has:
+                    members = servers.get(server_name, [])
+                    if username in members:
+                        members.remove(username)
+                        servers[server_name] = members
+                        save_server(server_name, members)
+
+                    last = _authoritative_room_remove_member(server_name, username, MY_SERVER_HOST)
+                    if last:
+                        _send_room_event_to_remotes(server_name, 'left', username, MY_SERVER_HOST)
+
+                    left_broadcast_needed = (username, server_name)
+            else:
+                try:
+                    room_name, host_part = server_name.split('@', 1)
+                    key = (username, room_name, host_part)
+                    prev = user_remote_counters.get(key, 0)
+                    if prev > 1:
+                        user_remote_counters[key] = prev - 1
+                    else:
+                        user_remote_counters.pop(key, None)
+                        remote_leave_payload = {
+                            'type': 'room_leave',
+                            'room': room_name,
+                            'sender': username
+                        }
+                        should_send_remote_leave = True
+                except Exception:
+                    pass
+
+            for sock, session_obj in list(socket_to_session.items()):
+                if session_obj is s:
+                    socket_to_session.pop(sock, None)
+
+        try:
+            sock = getattr(s, 'client_socket', None)
+            if sock:
+                try:
+                    with _send_state_lock:
+                        q = _send_queues.get(sock)
+                    if q is not None:
+                        try:
+                            q.put_nowait(None)
+                        except Exception:
+                            pass
+                    with _send_state_lock:
+                        _send_queues.pop(sock, None)
+                        _send_workers.pop(sock, None)
+                except Exception:
+                    pass
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        if should_send_remote_leave and remote_leave_payload is not None:
+            try:
+                send_remote_room_message(host_part, room_name, remote_leave_payload)
+            except Exception:
+                pass
+
+        if left_broadcast_needed:
+            u, srv = left_broadcast_needed
+            broadcast_message(f"*** {u} has left the server.", srv)
+
+    except Exception as e:
+        log_message(f"_evict_unreachable_session error: {e}")
 def send_private_message(sender_username: str, recipient_username: str, message: str) -> bool:
     delivered_any = False
     with session_lock:
@@ -1098,6 +1236,16 @@ def handle_client(client_socket, client_address):
                         if user_server is not None:
                             send_to_client(client_socket, f"You're already connected to the server '{user_server}'.", client_key)
                             continue
+
+                        probe_req = {
+                            'type': 'room_members_request',
+                            'room': room_name
+                        }
+                        probe_resp = send_remote_room_message(host_part, room_name, probe_req, timeout_sec=1)
+                        if not probe_resp or probe_resp.get('status') != 'ok':
+                            send_to_client(client_socket, "Server does not exist.", client_key)
+                            continue
+
                         user_server = f"{room_name}@{host_part}"
                         session.server_name = user_server
                         should_remote_join = False
@@ -1407,12 +1555,12 @@ def handle_dialback_check(msg_data):
         'result': 'ok'
     }
 
-def _send_remote_room_sync(target_host: str, target_port: int, data: dict):
+def _send_remote_room_sync(target_host: str, target_port: int, data: dict, timeout_sec: float | None = None, use_retry: bool = True):
     def _send_room_msg():
         try:
-            with socket.create_connection((target_host, target_port), timeout=5) as s:
+            with socket.create_connection((target_host, target_port), timeout=(timeout_sec or 5)) as s:
                 s.sendall((json.dumps(data) + '\n').encode('utf-8'))
-                s.settimeout(5)
+                s.settimeout(timeout_sec or 5)
                 response = b''
                 while not response.endswith(b'\n'):
                     chunk = s.recv(MAX_PACKET_SIZE)
@@ -1428,7 +1576,12 @@ def _send_remote_room_sync(target_host: str, target_port: int, data: dict):
         except Exception as e:
             raise
     
-    return send_with_retry(_send_room_msg)
+    if use_retry:
+        return send_with_retry(_send_room_msg)
+    try:
+        return _send_room_msg()
+    except Exception:
+        return None
 
 def cleanup_tasks():
     while True:
