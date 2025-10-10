@@ -538,11 +538,7 @@ def cache_dialback_result(host, msg_type, result):
     cache_key = f"{host}:{msg_type}"
     dialback_cache[cache_key] = (time.time(), result)
 
-
-
- 
-
-MAX_RETRIES = 3
+MAX_RETRIES = 1
 RETRY_DELAY = 1
 
 def send_with_retry(func, *args, **kwargs):
