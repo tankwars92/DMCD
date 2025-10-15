@@ -503,7 +503,7 @@ def _update_remote_subscriber_count(room: str, origin_host: str):
         subs.discard(origin_host)
 
 dialback_cache = {}
-DIALBACK_CACHE_TTL = 300
+DIALBACK_CACHE_TTL = 3600
 
 pending_dialback = {}
 
@@ -521,7 +521,7 @@ def cache_dialback_result(host, msg_type, result):
     cache_key = f"{host}:{msg_type}"
     dialback_cache[cache_key] = (time.time(), result)
 
-MAX_RETRIES = 2
+MAX_RETRIES = 1
 RETRY_DELAY = 1
 
 def send_with_retry(func, *args, **kwargs):
