@@ -633,7 +633,6 @@ def _send_room_event_to_remotes(room: str, event: str, username: str, origin_hos
         except Exception:
             pass
 
-
 class Session:
     def __init__(self, client_socket: socket.socket):
         self.client_socket = client_socket
@@ -944,7 +943,10 @@ def handle_client(client_socket, client_address):
                                     _update_remote_subscriber_count(room, origin_host)
                                     if first:
                                         _broadcast_room_event_locally(room, 'joined', sender, origin_host)
-                                        _send_room_event_to_remotes(room, 'joined', sender, origin_host)
+                                        try:
+                                            threading.Thread(target=_send_room_event_to_remotes, args=(room, 'joined', sender, origin_host, None), daemon=True).start()
+                                        except Exception:
+                                            pass
                                     client_socket.send((json.dumps({'status':'ok'}) + '\n').encode('utf-8'))
                                     client_socket.close()
                                     return
@@ -956,7 +958,10 @@ def handle_client(client_socket, client_address):
                                     _update_remote_subscriber_count(room, origin_host)
                                     if last:
                                         _broadcast_room_event_locally(room, 'left', sender, origin_host)
-                                        _send_room_event_to_remotes(room, 'left', sender, origin_host)
+                                        try:
+                                            threading.Thread(target=_send_room_event_to_remotes, args=(room, 'left', sender, origin_host, None), daemon=True).start()
+                                        except Exception:
+                                            pass
                                     client_socket.send((json.dumps({'status':'ok'}) + '\n').encode('utf-8'))
                                     client_socket.close()
                                     return
@@ -981,7 +986,10 @@ def handle_client(client_socket, client_address):
                                     origin_host = from_host
                                     payload = msg.get('payload') or {}
                                     _broadcast_room_event_locally(room, 'act', sender, origin_host, payload)
-                                    _send_room_event_to_remotes(room, 'act', sender, origin_host, payload)
+                                    try:
+                                        threading.Thread(target=_send_room_event_to_remotes, args=(room, 'act', sender, origin_host, payload), daemon=True).start()
+                                    except Exception:
+                                        pass
                                     client_socket.send((json.dumps({'status':'ok'}) + '\n').encode('utf-8'))
                                     client_socket.close()
                                     return
@@ -1094,6 +1102,13 @@ def handle_client(client_socket, client_address):
                         if user_server is not None:
                             send_to_client(client_socket, f"You're already connected to the server '{user_server}'.", client_key)
                             continue
+                            
+                        try:
+                            with socket.create_connection((host_part, 42439), timeout=3):
+                                pass
+                        except Exception:
+                            send_to_client(client_socket, "Server does not exist.", client_key)
+                            continue
                         user_server = f"{room_name}@{host_part}"
                         session.server_name = user_server
                         should_remote_join = False
@@ -1150,7 +1165,10 @@ def handle_client(client_socket, client_address):
                                         save_server(local_room, members)
                                 if should_broadcast_join:
                                     broadcast_message(f"*** {logged_in_user} has joined the server.", user_server)
-                                    _send_room_event_to_remotes(local_room, 'joined', logged_in_user, MY_SERVER_HOST)
+                                    try:
+                                        threading.Thread(target=_send_room_event_to_remotes, args=(local_room, 'joined', logged_in_user, MY_SERVER_HOST, None), daemon=True).start()
+                                    except Exception:
+                                        pass
                                 send_to_client(client_socket, f"Joined server '{local_room}' successfully.", client_key)
                 elif message.startswith("/delete_server") and logged_in_user == ADMIN_USERNAME:
                     parts = message.split(" ", 1)
@@ -1257,7 +1275,10 @@ def handle_client(client_socket, client_address):
                         send_remote_room_message(host_part, room_name, payload)
                     else:
                         broadcast_message(f"*** {logged_in_user} {act_name}", user_server, message_type='action_message')
-                        _send_room_event_to_remotes(room_name, 'act', logged_in_user, MY_SERVER_HOST, {'act': act_name})
+                        try:
+                            threading.Thread(target=_send_room_event_to_remotes, args=(room_name, 'act', logged_in_user, MY_SERVER_HOST, {'act': act_name}), daemon=True).start()
+                        except Exception:
+                            pass
                 elif message.startswith("/pm"):
                     parts = message.split(" ", 2)
                     if len(parts) < 3:
@@ -1338,7 +1359,10 @@ def handle_client(client_socket, client_address):
                             left_broadcast_needed = (s.username, s.server_name)
                             last = _authoritative_room_remove_member(s.server_name, s.username, MY_SERVER_HOST)
                             if last:
-                                _send_room_event_to_remotes(s.server_name, 'left', s.username, MY_SERVER_HOST)
+                                try:
+                                    threading.Thread(target=_send_room_event_to_remotes, args=(s.server_name, 'left', s.username, MY_SERVER_HOST, None), daemon=True).start()
+                                except Exception:
+                                    pass
                     else:
                         try:
                             room_name, host_part = s.server_name.split('@', 1)
