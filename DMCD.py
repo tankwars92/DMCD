@@ -10,6 +10,9 @@ import base64
 import random
 import struct
 import queue
+import sys
+
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 try:
     from Crypto.Cipher import AES
@@ -136,7 +139,6 @@ def enqueue_send(sock: socket.socket, message: str, client_key=None, message_typ
         q.put((message, client_key))
         return True
     except Exception as e:
-        log_message(f"enqueue_send error: {e}")
         return False
 
 os.makedirs(servers_dir, exist_ok=True)
@@ -433,6 +435,9 @@ users = load_users()
 bans = load_bans()
 servers = load_servers()
 
+from caps.caps import CapabilitiesManager
+capabilities_manager = CapabilitiesManager()
+
 default_server = 'general'
 if default_server not in servers:
     servers[default_server] = []
@@ -521,7 +526,7 @@ def cache_dialback_result(host, msg_type, result):
     cache_key = f"{host}:{msg_type}"
     dialback_cache[cache_key] = (time.time(), result)
 
-MAX_RETRIES = 1
+MAX_RETRIES = 2
 RETRY_DELAY = 1
 
 def send_with_retry(func, *args, **kwargs):
@@ -699,6 +704,7 @@ commands = {
     "/members": "- Get list of users on server.",
     "/pm": "<username> <message> - Send a private message to the specified user.",
     "/act": "<action> - Chat action, set your status.",
+    "/list_capabilities": "- Get a list of all available capabilities.",
     "/help": "- Shows this message."
 }
 
@@ -857,11 +863,9 @@ def handle_client(client_socket, client_address):
                                                 sock.send((json.dumps({'status': 'error', 'reason': 'failed'}) + '\n').encode('utf-8'))
                                     else:
                                         sock.send((json.dumps({'status': 'error', 'reason': 'Dialback failed'}) + '\n').encode('utf-8'))
-                                    
+                                        
                                     sock.close()
-                                    log_message(f"[remote_pm] Message processed")
                             except Exception as e:
-                                log_message(f"[remote_pm] Error: {e}")
                                 if msg_id in pending_dialback:
                                     _, _, _, sock = pending_dialback.pop(msg_id)
                                     try:
@@ -1305,6 +1309,37 @@ def handle_client(client_socket, client_address):
                 elif message.startswith("/help"):
                     help_message = "\n".join([f"{cmd} {desc}" for cmd, desc in commands.items()])
                     send_to_client(client_socket, help_message, client_key)
+                elif message.startswith("/list_capabilities"):
+                    caps_list = capabilities_manager.get_capabilities_list()
+                    if caps_list:
+                        caps_text = "Capabilities: " + ", ".join(caps_list) + ". Use /CAPABILITY_NAME for help."
+                    else:
+                        caps_text = "No capabilities available."
+                    send_to_client(client_socket, caps_text, client_key)
+                elif message.startswith("/") and message != "/" and not any(message.startswith(cmd) for cmd in ["/login", "/register", "/create_server", "/join_server", "/list_servers", "/members", "/pm", "/act", "/help", "/list_capabilities", "/ban", "/delete_server"]):
+                    cap_command = message[1:]
+                    parts = cap_command.split()
+                    if len(parts) > 1:
+                        command_part = parts[0]
+                        args = parts[1:]
+                    else:
+                        command_part = cap_command
+                        args = []
+
+                    server_context = {
+                        'clients_by_user': clients_by_user,
+                        'clients_by_server': clients_by_server,
+                        'socket_to_session': socket_to_session,
+                        'session_lock': session_lock,
+                        'users': users,
+                        'bans': bans,
+                        'servers': servers
+                    }
+                    
+                    if capabilities_manager.handle_capability_command(command_part, args, session, client_socket, client_key, server_context):
+                        pass
+                    else:
+                        send_to_client(client_socket, "Unknown command.", client_key)
                 elif message == "/":
                     send_to_client(client_socket, "*Ping!*", client_key)
                 else:
@@ -1341,7 +1376,10 @@ def handle_client(client_socket, client_address):
                     if s in user_sessions:
                         user_sessions.remove(s)
                     if not user_sessions:
-                        clients_by_user.pop(s.username, None)
+                        remaining_sessions = [sess for sess in clients_by_user.get(s.username, set()) 
+                                           if hasattr(sess, 'client_socket') and sess.client_socket]
+                        if not remaining_sessions:
+                            clients_by_user.pop(s.username, None)
                 if s and s.server_name:
                     server_sessions = clients_by_server.get(s.server_name, set())
                     if s in server_sessions:
