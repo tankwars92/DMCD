@@ -27,6 +27,7 @@ class Capability:
 class CapabilitiesManager:
     def __init__(self):
         self.capabilities = {}
+        self._raw_connection_handlers = [] 
         self._load_capabilities()
     
     def _load_capabilities(self):
@@ -36,7 +37,7 @@ class CapabilitiesManager:
         caps_dir = os.path.dirname(os.path.abspath(__file__))
         
         for filename in os.listdir(caps_dir):
-            if filename.endswith('.py') and filename != '__init__.py' and filename != 'caps.py':
+            if filename.endswith('.py') and filename != 'caps.py':
                 module_name = filename[:-3]
                 try:
                     module = importlib.import_module(f'caps.{module_name}')
@@ -46,13 +47,21 @@ class CapabilitiesManager:
                         if (isinstance(attr, type) and 
                             issubclass(attr, Capability) and 
                             attr != Capability):
-                            capability = attr()
-                            self._register_capability(capability)
+                            try:
+                                capability = attr()
+                                self._register_capability(capability)
+                            except Exception:
+                                continue
                 except Exception as e:
                     print(f"Error loading capability {module_name}: {e}")
     
     def _register_capability(self, capability):
         self.capabilities[capability.name] = capability
+        if hasattr(capability, 'sniff_raw_connection') and hasattr(capability, 'handle_raw_connection'):
+            try:
+                self._raw_connection_handlers.append(capability)
+            except Exception:
+                pass
     
     def get_capability(self, name):
         return self.capabilities.get(name)
@@ -76,5 +85,19 @@ class CapabilitiesManager:
                 send_to_client(client_socket, capability.get_help(), client_key)
                 return True
         
+        return False
+    
+    def try_handle_raw_connection(self, client_socket, client_address, peek_bytes):
+        try:
+            handlers = list(self._raw_connection_handlers)
+        except Exception:
+            handlers = []
+        for cap in handlers:
+            try:
+                if cap.sniff_raw_connection(peek_bytes):
+                    cap.handle_raw_connection(client_socket, client_address)
+                    return True
+            except Exception:
+                continue
         return False
     

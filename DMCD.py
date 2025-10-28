@@ -1451,7 +1451,36 @@ def start_tcp_server(host='0.0.0.0', port=TCP_PORT):
 
     while True:
         client_socket, client_address = server_socket.accept()
-        client_thread = threading.Thread(target=handle_client, args=(client_socket, client_address))
+
+        def _dispatch_connection(sock: socket.socket, addr):
+            try:
+                sock.settimeout(0.5)
+                try:
+                    peek = sock.recv(1024, socket.MSG_PEEK)
+                except socket.timeout:
+                    peek = b''
+                except Exception:
+                    peek = b''
+                finally:
+                    try:
+                        sock.settimeout(None)
+                    except Exception:
+                        pass
+
+                try:
+                    if capabilities_manager.try_handle_raw_connection(sock, addr, peek):
+                        return
+                except Exception:
+                    pass
+
+                handle_client(sock, addr)
+            except Exception:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+        client_thread = threading.Thread(target=_dispatch_connection, args=(client_socket, client_address))
         client_thread.start()
 
 def handle_dialback_check(msg_data):
