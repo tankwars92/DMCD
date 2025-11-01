@@ -744,9 +744,9 @@ def _send_remote_private_message_sync(sender, recipient, host, message):
 
 def deliver_remote_pm(sender, recipient, message, server_host=None, from_host=None):
     sender_display = sender
-    if from_host:
+    if from_host and from_host != MY_SERVER_HOST:
         sender_display = f"{sender}@{from_host}"
-    elif server_host:
+    elif server_host and server_host != MY_SERVER_HOST:
         sender_display = f"{sender}@{server_host}"
     pm_text = f"(Private) {sender_display}: {message}"
     with session_lock:
@@ -1292,8 +1292,11 @@ def handle_client(client_socket, client_address):
                     m = re.match(r"^([\w\-]+)@([\w\.-]+)$", recipient)
                     if m:
                         remote_user, remote_host = m.group(1), m.group(2)
-                        threading.Thread(target=handle_remote_pm_tcp, args=(logged_in_user, remote_user, remote_host, private_message, client_socket, recipient, client_key), daemon=True).start()
-                        continue
+                        if remote_host == MY_SERVER_HOST:
+                            recipient = remote_user 
+                        else:
+                            threading.Thread(target=handle_remote_pm_tcp, args=(logged_in_user, remote_user, remote_host, private_message, client_socket, recipient, client_key), daemon=True).start()
+                            continue
                     if recipient not in users:
                         send_to_client(client_socket, "User does not exist.", client_key)
                         continue
