@@ -1268,6 +1268,10 @@ def handle_client(client_socket, client_address):
 
                     _, act_name = parts 
 
+                    if act_name == "has joined the server." or act_name == "has left the server.":
+                        send_to_client(client_socket, "This action is not allowed.", client_key)
+                        continue
+
                     room_name, host_part = parse_room_and_host(user_server)
                     if host_part and host_part != MY_SERVER_HOST:
                         payload = {
