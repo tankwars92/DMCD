@@ -53,7 +53,7 @@ class CapabilitiesManager:
                             except Exception:
                                 continue
                 except Exception as e:
-                    print(f"Error loading capability {module_name}: {e}")
+                    print(f"Error loading capability {module_name}: {e}.")
     
     def _register_capability(self, capability):
         self.capabilities[capability.name] = capability

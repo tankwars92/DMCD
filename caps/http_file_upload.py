@@ -52,12 +52,12 @@ def _start_cleanup_once():
         _cleanup_started = True
 
 
-def _safe_filename(name: str) -> str:
+def _safe_filename(name):
     allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
     return ''.join(ch for ch in name if ch in allowed) or 'file'
 
 
-def _http_response(sock: socket.socket, code: int, headers: dict, body: bytes):
+def _http_response(sock, code, headers, body):
     reason = {200: 'OK', 400: 'Bad Request', 404: 'Not Found', 500: 'Internal Server Error'}.get(code, 'OK')
     head = f"HTTP/1.1 {code} {reason}\r\n".encode('utf-8')
     for k, v in headers.items():
@@ -81,13 +81,13 @@ class HttpFileUploadCapability(Capability):
         )
         _start_cleanup_once()
 
-    def sniff_raw_connection(self, peek_bytes: bytes) -> bool:
+    def sniff_raw_connection(self, peek_bytes):
         if not peek_bytes:
             return False
         head = peek_bytes[:8].upper()
         return head.startswith(b'GET ') or head.startswith(b'POST ')
 
-    def handle_raw_connection(self, client_socket: socket.socket, client_address):
+    def handle_raw_connection(self, client_socket, client_address):
         try:
             client_socket.settimeout(10)
             req = b''
@@ -146,7 +146,7 @@ class HttpFileUploadCapability(Capability):
             except Exception:
                 pass
 
-    def _handle_upload(self, sock: socket.socket, headers: dict, body: bytes):
+    def _handle_upload(self, sock, headers, body):
         ctype = headers.get('content-type', '')
         if 'multipart/form-data' not in ctype:
             _http_response(sock, 400, {'Content-Length': '0', 'Connection': 'close'}, b'')
@@ -225,7 +225,7 @@ class HttpFileUploadCapability(Capability):
         if not saved:
             _http_response(sock, 400, {'Content-Length': '0', 'Connection': 'close'}, b'')
 
-    def _handle_download(self, sock: socket.socket, path: str):
+    def _handle_download(self, sock, path):
         parts = path.split('/')
         if len(parts) < 4:
             _http_response(sock, 404, {'Content-Length': '0', 'Connection': 'close'}, b'')
@@ -268,7 +268,7 @@ class HttpFileUploadCapability(Capability):
             port = DMCD.TCP_PORT
         except Exception:
             host = 'localhost'
-            port = 42439
+            port = 42442
         ttl = UPLOAD_TTL_SECONDS
         max_sz = MAX_UPLOAD_SIZE_BYTES
         msg = (
