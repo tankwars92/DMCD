@@ -61,7 +61,7 @@ DELAYED_MESSAGE_TYPES = {
     'room_event'        
 }
 
-def _send_worker(sock: socket.socket, q: 'queue.Queue[tuple[str, object]]'):
+def _send_worker(sock, q):
     last_sent_at = 0.0
     while True:
         try:
@@ -88,7 +88,7 @@ def _send_worker(sock: socket.socket, q: 'queue.Queue[tuple[str, object]]'):
                         message_to_send = message
                     sock.send(message_to_send.encode('utf-8'))
             except Exception as e:
-                log_message(f"Error sending to client: {e}")
+                log_message(f"Error sending to client: {e}.")
                 break
 
             last_sent_at = time.time()
@@ -105,7 +105,7 @@ def _send_worker(sock: socket.socket, q: 'queue.Queue[tuple[str, object]]'):
             except Exception:
                 pass
 
-def _send_immediate(sock: socket.socket, message: str, client_key=None) -> bool:
+def _send_immediate(sock, message, client_key=None):
     try:
         if client_key:
             if isinstance(client_key, tuple):
@@ -119,10 +119,10 @@ def _send_immediate(sock: socket.socket, message: str, client_key=None) -> bool:
             sock.send(message.encode('utf-8'))
             return True
     except Exception as e:
-        log_message(f"Error sending to client: {e}")
+        log_message(f"Error sending to client: {e}.")
         return False
 
-def enqueue_send(sock: socket.socket, message: str, client_key=None, message_type: str = 'system') -> bool:
+def enqueue_send(sock, message, client_key=None, message_type='system'):
     try:
         if message_type not in DELAYED_MESSAGE_TYPES:
             return _send_immediate(sock, message, client_key)
@@ -147,8 +147,6 @@ def log_message(message):
     current_time = time.strftime("%H:%M:%S", time.localtime())
     print(f"[{current_time}] {message}")
 
-    
-
 def derive_session_keys(shared_bytes):
     try:
         import hashlib
@@ -156,7 +154,7 @@ def derive_session_keys(shared_bytes):
         mac_key = hashlib.sha256(shared_bytes + b"|MAC").digest()
         return enc_key, mac_key
     except Exception as e:
-        log_message(f"Key derivation error: {e}")
+        log_message(f"Key derivation error: {e}.")
         return None, None
 
 DH_P = int(
@@ -165,7 +163,6 @@ DH_P = int(
     "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245"
     "E485B576625E7EC6F44C42E9A63A3620FFFFFFFFFFFFFFFF", 16)
 DH_G = 2
-
 
 def encrypt_message(message, key):
     try:
@@ -180,7 +177,7 @@ def encrypt_message(message, key):
         
         return iv + encrypted
     except Exception as e:
-        log_message(f"Encryption error: {e}")
+        log_message(f"Encryption error: {e}.")
         return None
 
 def decrypt_message(encrypted_data, key):
@@ -201,7 +198,7 @@ def decrypt_message(encrypted_data, key):
         message_bytes = decrypted[:-padding_length]
         return message_bytes.decode('utf-8')
     except Exception as e:
-        log_message(f"Decryption error: {e}")
+        log_message(f"Decryption error: {e}.")
         return None
 
 def send_encrypted_message(socket, message, key, mac_key=None):
@@ -217,7 +214,7 @@ def send_encrypted_message(socket, message, key, mac_key=None):
             socket.send(length + payload)
             return True
     except Exception as e:
-        log_message(f"Error sending encrypted message: {e}")
+        log_message(f"Error sending encrypted message: {e}.")
     return False
 
 def receive_encrypted_message(socket, key, mac_key=None):
@@ -241,7 +238,7 @@ def receive_encrypted_message(socket, key, mac_key=None):
             import hmac, hashlib
             expected = hmac.new(mac_key, data_part, hashlib.sha256).digest()
             if not hmac.compare_digest(mac_part, expected):
-                log_message("HMAC verification failed")
+                log_message("HMAC verification failed.")
                 return None
             encrypted_payload = data_part
         else:
@@ -250,7 +247,7 @@ def receive_encrypted_message(socket, key, mac_key=None):
         decrypted = decrypt_message(encrypted_payload, key)
         return decrypted.strip() if decrypted else None
     except Exception as e:
-        log_message(f"Error receiving encrypted message: {e}")
+        log_message(f"Error receiving encrypted message: {e}.")
         return None
 
 def handle_key_exchange(client_socket, client_address):
@@ -265,13 +262,13 @@ def handle_key_exchange(client_socket, client_address):
 
         len_data = client_socket.recv(2)
         if len(len_data) != 2:
-            raise Exception("Failed to receive DH B length")
+            raise Exception("Failed to receive DH B length.")
         blen = struct.unpack('>H', len_data)[0]
         B_bytes = b''
         while len(B_bytes) < blen:
             chunk = client_socket.recv(blen - len(B_bytes))
             if not chunk:
-                raise Exception("Failed to receive DH B")
+                raise Exception("Failed to receive DH B.")
             B_bytes += chunk
         try:
             B = int.from_bytes(B_bytes, byteorder='big')
@@ -301,7 +298,7 @@ def handle_key_exchange(client_socket, client_address):
         handle_client(client_socket, client_address)
         
     except Exception as e:
-        log_message(f"Key exchange error for {client_address}: {e}")
+        log_message(f"Key exchange error for {client_address}: {e}.")
     finally:
         try:
             client_socket.close()
@@ -447,25 +444,25 @@ members_by_room = {}
 remote_subscribers_by_room = {}
 user_remote_counters = {}
 
-def _room_members(room: str):
+def _room_members(room):
     return members_by_room.setdefault(room, {})
 
-def _remote_subscribers(room: str):
+def _remote_subscribers(room):
     return remote_subscribers_by_room.setdefault(room, set())
 
-def parse_room_and_host(name: str):
+def parse_room_and_host(name):
     if '@' in name:
         idx = name.rfind('@')
         return name[:idx], name[idx+1:]
     return name, None
 
-def display_name_for(viewer_host: str, username: str, origin_host: str):
+def display_name_for(viewer_host, username, origin_host):
     return username if origin_host == viewer_host else f"{username}@{origin_host}"
 
 def get_advertised_host() -> str:
     return MY_SERVER_HOST
 
-def format_room_event_text(viewer_host: str, event: str, username: str, origin_host: str, payload: dict | None = None):
+def format_room_event_text(viewer_host, event, username, origin_host, payload=None):
     disp = display_name_for(viewer_host, username, origin_host)
     if event == 'joined':
         return f"*** {disp} has joined the server."
@@ -479,7 +476,7 @@ def format_room_event_text(viewer_host: str, event: str, username: str, origin_h
         return f"*** {disp} {act}"
     return ''
 
-def _authoritative_room_add_member(room: str, username: str, origin_host: str) -> bool:
+def _authoritative_room_add_member(room, username, origin_host):
     room_map = _room_members(room)
     key = (username, origin_host)
     prev = room_map.get(key, 0)
@@ -487,7 +484,7 @@ def _authoritative_room_add_member(room: str, username: str, origin_host: str) -
 
     return prev == 0
 
-def _authoritative_room_remove_member(room: str, username: str, origin_host: str) -> bool:
+def _authoritative_room_remove_member(room, username, origin_host):
     room_map = _room_members(room)
     key = (username, origin_host)
     prev = room_map.get(key, 0)
@@ -498,7 +495,7 @@ def _authoritative_room_remove_member(room: str, username: str, origin_host: str
         room_map[key] = prev - 1
         return False
 
-def _update_remote_subscriber_count(room: str, origin_host: str):
+def _update_remote_subscriber_count(room, origin_host):
     room_map = _room_members(room)
     hosts_present = any(h == origin_host for (_, h) in room_map.keys())
     subs = _remote_subscribers(room)
@@ -536,9 +533,9 @@ def send_with_retry(func, *args, **kwargs):
             return result
     except Exception as e:
         if "timed out" in str(e) or "timeout" in str(e):
-            log_message(f"[retry] Timeout: {e}")
+            log_message(f"[retry] Timeout: {e}.")
         else:
-            log_message(f"[retry] Error: {e}")
+            log_message(f"[retry] Error: {e}.")
             return None
     
     def _retry_worker():
@@ -547,13 +544,13 @@ def send_with_retry(func, *args, **kwargs):
                 time.sleep(RETRY_DELAY)
                 result = func(*args, **kwargs)
                 if result is not None:
-                    log_message(f"[retry] Sucessfully after {attempt + 1} attempts")
+                    log_message(f"[retry] Sucessfully after {attempt + 1} attempts.")
                     return
             except Exception as e:
                 if "timed out" in str(e) or "timeout" in str(e):
-                    log_message(f"[retry] Attempt {attempt + 1}/{MAX_RETRIES} timeout: {e}")
+                    log_message(f"[retry] Attempt {attempt + 1}/{MAX_RETRIES} timeout: {e}.")
                 else:
-                    log_message(f"[retry] Error: {e}")
+                    log_message(f"[retry] Error: {e}.")
                     break
     
     threading.Thread(target=_retry_worker, daemon=True).start()
@@ -591,15 +588,15 @@ def send_dialback_check(from_host, msg_id, msg_type, **kwargs):
                         cache_dialback_result(from_host, msg_type, True)
                     return result
                 except Exception as e:
-                    log_message(f"[dialback_check] Error parsing response: {e}")
+                    log_message(f"[dialback_check] Error parsing response: {e}.")
                     return False
         except Exception as e:
-            log_message(f"[dialback_check] Connection error: {e}")
+            log_message(f"[dialback_check] Connection error: {e}.")
             raise
     
     return send_with_retry(_send_dialback)
 
-def send_remote_room_message(host: str, room: str, payload: dict) -> dict | None:
+def send_remote_room_message(host, room, payload):
     if host is None:
         return None
     data = {
@@ -609,7 +606,7 @@ def send_remote_room_message(host: str, room: str, payload: dict) -> dict | None
     }
     return _send_remote_room_sync(host, 42439, data)
 
-def _broadcast_room_event_locally(room: str, event: str, username: str, origin_host: str, payload: dict | None = None, room_key: str | None = None):
+def _broadcast_room_event_locally(room, event, username, origin_host, payload=None, room_key=None):
     try:
         text = format_room_event_text(MY_SERVER_HOST, event, username, origin_host, payload)
         target_key = room_key or room
@@ -618,7 +615,7 @@ def _broadcast_room_event_locally(room: str, event: str, username: str, origin_h
     except Exception as e:
         pass
 
-def _send_room_event_to_remotes(room: str, event: str, username: str, origin_host: str, payload: dict | None = None):
+def _send_room_event_to_remotes(room, event, username, origin_host, payload=None):
     subs = list(_remote_subscribers(room))
     for host in subs:
         if host == MY_SERVER_HOST:
@@ -639,17 +636,16 @@ def _send_room_event_to_remotes(room: str, event: str, username: str, origin_hos
             pass
 
 class Session:
-    def __init__(self, client_socket: socket.socket):
+    def __init__(self, client_socket):
         self.client_socket = client_socket
         self.username = None
         self.server_name = None
-        self.protocol = 'tcp'
         self.created_at = time.time()
 
-    def send_text(self, message: str, message_type: str = 'system') -> bool:
+    def send_text(self, message, message_type='system'):
         return enqueue_send(self.client_socket, message, None, message_type)
     
-def broadcast_message(message, server_name, sender_session: 'Session' = None, message_type: str = 'broadcast_message'):
+def broadcast_message(message, server_name, sender_session=None, message_type='broadcast_message'):
     try:
         with session_lock:
             sessions = list(clients_by_server.get(server_name, set()))
@@ -664,10 +660,10 @@ def broadcast_message(message, server_name, sender_session: 'Session' = None, me
             else:
                 sess.send_text(message, message_type)
     except Exception as e:
-        log_message(f"broadcast_message error: {e}")
+        log_message(f"broadcast_message error: {e}.")
 
 
-def send_private_message(sender_username: str, recipient_username: str, message: str) -> bool:
+def send_private_message(sender_username, recipient_username, message):
     delivered_any = False
     with session_lock:
         recipient_sessions = list(clients_by_user.get(recipient_username, set()))
@@ -791,7 +787,7 @@ def handle_remote_pm_tcp(sender, recipient, host, private_message, client_socket
             return
     notify_tcp_result(client_socket, status, recipient_display, client_key)
 
-def send_to_client(client_socket, message, client_key=None, message_type: str = 'system'):
+def send_to_client(client_socket, message, client_key=None, message_type='system'):
     return enqueue_send(client_socket, message, client_key, message_type)
 
 def receive_from_client(client_socket, client_key=None):
@@ -806,7 +802,7 @@ def receive_from_client(client_socket, client_key=None):
             data = client_socket.recv(MAX_PACKET_SIZE).decode('utf-8').strip()
             return data if data else None
     except Exception as e:
-        log_message(f"Error receiving from client: {e}")
+        log_message(f"Error receiving from client: {e}.")
         return None
 
 def handle_client(client_socket, client_address):
@@ -820,7 +816,7 @@ def handle_client(client_socket, client_address):
     client_key = client_keys.get(client_address)
     use_encryption = client_key is not None
 
-    log_message(f"TCP client {client_address} connected {'(encrypted)' if use_encryption else '(unencrypted)'}")
+    log_message(f"TCP client {client_address} connected {'(encrypted)' if use_encryption else '(unencrypted)'}.")
 
     try:
         client_socket.settimeout(0.5)
@@ -1027,7 +1023,7 @@ def handle_client(client_socket, client_address):
             last_cmd = command
 
             if not command == "/":
-                log_message(f"TCP {client_address} message: {command}")
+                log_message(f"TCP {client_address} message: {command}.")
 
             if command.startswith("/register"):
                 parts = command.split(" ", 2)
@@ -1069,7 +1065,7 @@ def handle_client(client_socket, client_address):
         log_message(f"TCP client {client_address} disconnected unexpectedly.")
         client_socket.close()
     except Exception as e:
-        log_message(f"TCP client {client_address} error: {e}")
+        log_message(f"TCP client {client_address} error: {e}.")
 
     try:
         while True:
@@ -1189,8 +1185,6 @@ def handle_client(client_socket, client_address):
                         if os.path.exists(os.path.join(servers_dir, f'{server_name}.json')):
                             os.remove(os.path.join(servers_dir, f'{server_name}.json'))
                         
-                        broadcast_message(f"*** Server '{server_name}' has been deleted.", server_name)
-                        
                         send_to_client(client_socket, f"Server '{server_name}' deleted successfully.", client_key)
 
                 elif message.startswith("/list_servers"):
@@ -1252,10 +1246,9 @@ def handle_client(client_socket, client_address):
                         for sock, s in list(socket_to_session.items()):
                             if s.username == banned_user:
                                 socket_to_session.pop(sock, None)
+
                     bans[banned_user] = "BANNED"
                     save_bans(bans)
-                    for srv in servers_to_notify:
-                        broadcast_message(f"*** {banned_user} has been banned.", srv)
                 elif message.startswith("/act"):
                     parts = message.split(" ", 1)
                     if len(parts) < 2:
@@ -1368,7 +1361,7 @@ def handle_client(client_socket, client_address):
                         broadcast_message(full_message, user_server, message_type='chat_message')
                         _send_room_event_to_remotes(room_name, 'message', logged_in_user, MY_SERVER_HOST, {'text': message})
     except Exception as e:
-        log_message(f"TCP client {client_address} error: {e}")
+        log_message(f"TCP client {client_address} error: {e}.")
 
     finally:
         try:
@@ -1447,7 +1440,7 @@ def handle_client(client_socket, client_address):
             if left_broadcast_needed:
                 u, srv = left_broadcast_needed
                 broadcast_message(f"*** {u} has left the server.", srv)
-        log_message(f"TCP client {client_address} disconnected")
+        log_message(f"TCP client {client_address} disconnected.")
 
 
 def start_tcp_server(host='0.0.0.0', port=TCP_PORT):
@@ -1459,7 +1452,7 @@ def start_tcp_server(host='0.0.0.0', port=TCP_PORT):
     while True:
         client_socket, client_address = server_socket.accept()
 
-        def _dispatch_connection(sock: socket.socket, addr):
+        def _dispatch_connection(sock, addr):
             try:
                 sock.settimeout(0.5)
                 try:
@@ -1501,7 +1494,7 @@ def handle_dialback_check(msg_data):
         'result': 'ok'
     }
 
-def _send_remote_room_sync(target_host: str, target_port: int, data: dict):
+def _send_remote_room_sync(target_host, target_port, data):
     def _send_room_msg():
         try:
             with socket.create_connection((target_host, target_port), timeout=5) as s:
