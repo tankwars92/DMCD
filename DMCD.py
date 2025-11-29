@@ -1,4 +1,3 @@
-import asyncio
 import socket
 import threading
 import json
@@ -92,6 +91,7 @@ def _send_worker(sock, q):
                 break
 
             last_sent_at = time.time()
+            
         except Exception:
             break
 
@@ -138,7 +138,7 @@ def enqueue_send(sock, message, client_key=None, message_type='system'):
                 worker.start()
         q.put((message, client_key))
         return True
-    except Exception as e:
+    except Exception:
         return False
 
 os.makedirs(servers_dir, exist_ok=True)
@@ -544,7 +544,7 @@ def send_with_retry(func, *args, **kwargs):
                 time.sleep(RETRY_DELAY)
                 result = func(*args, **kwargs)
                 if result is not None:
-                    log_message(f"[retry] Sucessfully after {attempt + 1} attempts.")
+                    log_message(f"[retry] Successfully after {attempt + 1} attempts.")
                     return
             except Exception as e:
                 if "timed out" in str(e) or "timeout" in str(e):
@@ -559,7 +559,7 @@ def send_with_retry(func, *args, **kwargs):
 def send_dialback_check(from_host, msg_id, msg_type, **kwargs):
     cached_result = get_cached_dialback_result(from_host, msg_type)
 
-    if cached_result is True:
+    if cached_result:
         return True
     
     def _send_dialback():
@@ -612,7 +612,7 @@ def _broadcast_room_event_locally(room, event, username, origin_host, payload=No
         target_key = room_key or room
         message_type = 'room_event' if event in ['message', 'act'] else 'system'
         broadcast_message(text, target_key, message_type=message_type)
-    except Exception as e:
+    except Exception:
         pass
 
 def _send_room_event_to_remotes(room, event, username, origin_host, payload=None):
@@ -731,9 +731,9 @@ def _send_remote_private_message_sync(sender, recipient, host, message):
             try:
                 resp_json = json.loads(response.decode('utf-8').strip())
                 return resp_json
-            except Exception as e:
+            except Exception:
                 return {'status': 'error', 'reason': 'parse_error'}
-    except Exception as e:
+    except Exception:
         return {'status': 'error', 'reason': 'network_error'}
 
  
@@ -759,7 +759,7 @@ def deliver_remote_pm(sender, recipient, message, server_host=None, from_host=No
             ok = sess.send_text(pm_text, 'private_message')
         delivered_any = delivered_any or ok
     if delivered_any:
-        log_message(f"[remote_pm] Sucessfully sent to {recipient} ({len(recipient_sessions)} sessions)")
+        log_message(f"[remote_pm] Successfully sent to {recipient} ({len(recipient_sessions)} sessions)")
     else:
         log_message(f"[remote_pm] Failed to send remote_pm to {recipient}")
     return delivered_any
@@ -861,7 +861,7 @@ def handle_client(client_socket, client_address):
                                         sock.send((json.dumps({'status': 'error', 'reason': 'Dialback failed'}) + '\n').encode('utf-8'))
                                         
                                     sock.close()
-                            except Exception as e:
+                            except Exception:
                                 if msg_id in pending_dialback:
                                     _, _, _, sock = pending_dialback.pop(msg_id)
                                     try:
@@ -994,7 +994,7 @@ def handle_client(client_socket, client_address):
                                     client_socket.close()
                                     return
                                     
-                            except Exception as e:
+                            except Exception:
                                 try:
                                     client_socket.send((json.dumps({'status':'error','reason':'Internal error'}) + '\n').encode('utf-8'))
                                     client_socket.close()
@@ -1051,7 +1051,7 @@ def handle_client(client_socket, client_address):
                     with session_lock:
                         sessions = clients_by_user.get(username)
                         if sessions is None:
-                            clients_by_user[username] = set([session])
+                            clients_by_user[username] = {session}
                         else:
                             sessions.add(session)
                         socket_to_session[client_socket] = session
@@ -1115,7 +1115,7 @@ def handle_client(client_socket, client_address):
                         with session_lock:
                             server_sessions = clients_by_server.get(user_server)
                             if server_sessions is None:
-                                clients_by_server[user_server] = set([session])
+                                clients_by_server[user_server] = {session}
                             else:
                                 server_sessions.add(session)
 
@@ -1137,7 +1137,7 @@ def handle_client(client_socket, client_address):
                         if local_room not in servers:
                             send_to_client(client_socket, "Server does not exist.", client_key)
                         else:
-                            if user_server != None:
+                            if user_server is not None:
                                 send_to_client(client_socket, f"You're already connected to the server '{user_server}'.", client_key)
                             else:
                                 user_server = local_room
@@ -1146,7 +1146,7 @@ def handle_client(client_socket, client_address):
                                 with session_lock:
                                     server_sessions = clients_by_server.get(local_room)
                                     if server_sessions is None:
-                                        clients_by_server[local_room] = set([session])
+                                        clients_by_server[local_room] = {session}
                                         should_broadcast_join = True
                                     else:
                                         had_sessions_for_user = any(s.username == logged_in_user for s in server_sessions)
@@ -1286,7 +1286,7 @@ def handle_client(client_socket, client_address):
                         send_to_client(client_socket, "Usage: /pm <username> <message>", client_key)
                         continue
                     _, recipient, private_message = parts
-                    m = re.match(r"^([\w\-]+)@([\w\.-]+)$", recipient)
+                    m = re.match(r"^([\w\-]+)@([\w.-]+)$", recipient)
                     if m:
                         remote_user, remote_host = m.group(1), m.group(2)
                         if remote_host == MY_SERVER_HOST:
@@ -1366,7 +1366,6 @@ def handle_client(client_socket, client_address):
     finally:
         try:
             left_broadcast_needed = None
-            user_to_log = logged_in_user
             with session_lock:
                 s = socket_to_session.pop(client_socket, None)
                 if s is None:
@@ -1485,9 +1484,7 @@ def start_tcp_server(host='0.0.0.0', port=TCP_PORT):
 
 def handle_dialback_check(msg_data):
     msg_id = msg_data.get('msg_id')
-    msg_type = msg_data.get('msg_type')
-    from_host = msg_data.get('from_host')
-    
+
     return {
         'type': 'dialback_result', 
         'msg_id': msg_id, 
@@ -1512,7 +1509,7 @@ def _send_remote_room_sync(target_host, target_port, data):
                     except Exception:
                         return None
                 return None
-        except Exception as e:
+        except Exception:
             raise
     
     return send_with_retry(_send_room_msg)
