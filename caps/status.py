@@ -31,7 +31,7 @@ class StatusCapability(Capability):
         else:
             import DMCD
             with DMCD.session_lock:
-                user_sessions = list(server3.clients_by_user.get(username, set()))
+                user_sessions = list(DMCD.clients_by_user.get(username, set()))
         
         if user_sessions:
             self.send_message(f"{username} is online.", client_socket, client_key)
