@@ -1,14 +1,12 @@
+import json
+import mimetypes
 import os
+import shutil
 import threading
 import time
 import uuid
-import json
-import shutil
-import mimetypes
-import socket
 
 from caps.caps import Capability
-
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 UPLOAD_DIR = os.path.join(BASE_DIR, 'uploads')
@@ -155,7 +153,7 @@ class HttpFileUploadCapability(Capability):
             cl = int(headers.get('content-length', '0') or '0')
         except Exception:
             cl = 0
-        if MAX_UPLOAD_SIZE_BYTES > 0 and cl > MAX_UPLOAD_SIZE_BYTES:
+        if 0 < MAX_UPLOAD_SIZE_BYTES < cl:
             _http_response(sock, 400, {'Content-Length': '0', 'Connection': 'close'}, b'')
             return
         boundary = None
@@ -192,7 +190,7 @@ class HttpFileUploadCapability(Capability):
                         filename = _safe_filename(fn.decode('utf-8', errors='ignore'))
                 except Exception:
                     pass
-                if MAX_UPLOAD_SIZE_BYTES > 0 and len(file_payload) > MAX_UPLOAD_SIZE_BYTES:
+                if 0 < MAX_UPLOAD_SIZE_BYTES < len(file_payload):
                     _http_response(sock, 400, {'Content-Length': '0', 'Connection': 'close'}, b'')
                     break
                 file_id = uuid.uuid4().hex
