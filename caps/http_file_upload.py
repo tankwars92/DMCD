@@ -265,8 +265,8 @@ class HttpFileUploadCapability(Capability):
             host = DMCD.MY_SERVER_HOST
             port = DMCD.TCP_PORT
         except Exception:
-            host = 'localhost'
-            port = 42442
+            host = '127.0.0.1'
+            port = 42439
         ttl = UPLOAD_TTL_SECONDS
         max_sz = MAX_UPLOAD_SIZE_BYTES
         msg = (
