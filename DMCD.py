@@ -27,6 +27,39 @@ except ImportError:
         )
         sys.exit(1)
 
+def load_users():
+    if os.path.exists(users_file):
+        with open(users_file, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {}
+
+def save_users(users):
+    with open(users_file, 'w', encoding='utf-8') as f:
+        json.dump(users, f, ensure_ascii=False, indent=4)
+
+def load_servers():
+    servers = {}
+    for filename in os.listdir(servers_dir):
+        if filename.endswith('.json'):
+            server_name = filename[:-5]
+            with open(os.path.join(servers_dir, filename), 'r', encoding='utf-8') as f:
+                servers[server_name] = json.load(f)
+    return servers
+
+def save_server(server_name, server_data):
+    with open(os.path.join(servers_dir, f'{server_name}.json'), 'w', encoding='utf-8') as f:
+        json.dump(server_data, f, ensure_ascii=False, indent=4)
+
+def load_bans():
+    if os.path.exists(bans_file):
+        with open(bans_file, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {}
+
+def save_bans(bans):
+    with open(bans_file, 'w', encoding='utf-8') as f:
+        json.dump(bans, f, ensure_ascii=False, indent=4)
+
 # Change this!
 MY_SERVER_HOST = "example.com"
 TCP_PORT = 42439
@@ -35,6 +68,13 @@ ADMIN_USERNAME = "ADMIN"
 
 IV_SIZE = 16
 MAX_PACKET_SIZE = 32 * 1024
+
+DH_P = int(
+    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1"
+    "29024E088A67CC74020BBEA63B139B22514A08798E3404DD"
+    "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245"
+    "E485B576625E7EC6F44C42E9A63A3620FFFFFFFFFFFFFFFF", 16)
+DH_G = 2
 
 users_file = 'users.json'
 bans_file = 'bans.json'
@@ -45,6 +85,13 @@ clients_by_server = {}
 socket_to_session = {}
 client_keys = {}
 
+members_by_room = {}
+remote_subscribers_by_room = {}
+user_remote_counters = {}
+
+dialback_cache = {}
+pending_dialback = {}
+
 session_lock = threading.RLock()
 
 SEND_DELAY_SECONDS = 0.15
@@ -53,12 +100,42 @@ _send_workers = {}
 _send_state_lock = threading.RLock()
 
 DELAYED_MESSAGE_TYPES = {
-    'chat_message',     
-    'private_message', 
-    'action_message',    
-    'broadcast_message', 
-    'room_event'        
+    'chat_message',
+    'private_message',
+    'action_message',
+    'broadcast_message',
+    'room_event'
 }
+
+DIALBACK_CACHE_TTL = 3600
+MAX_RETRIES = 2
+RETRY_DELAY = 1
+
+default_server = 'general'
+
+commands = {
+    "/login": "<username> <password> - Login with username and password.",
+    "/register": "<username> <password> - Register a new user.",
+    "/create_server": "<server name> - Create a new communication server.",
+    "/join_server": "<server name > - Log in to the communication server.",
+    "/list_servers": "- Get a list of all available servers for communication.",
+    "/members": "- Get list of users on server.",
+    "/pm": "<username> <message> - Send a private message to the specified user.",
+    "/act": "<action> - Chat action, set your status.",
+    "/list_capabilities": "- Get a list of all available capabilities.",
+    "/help": "- Shows this message."
+}
+
+users = load_users()
+bans = load_bans()
+servers = load_servers()
+
+from caps.caps import CapabilitiesManager
+capabilities_manager = CapabilitiesManager()
+
+if default_server not in servers:
+    servers[default_server] = []
+    save_server(default_server, servers[default_server])
 
 def _send_worker(sock, q):
     last_sent_at = 0.0
@@ -156,13 +233,6 @@ def derive_session_keys(shared_bytes):
     except Exception as e:
         log_message(f"Key derivation error: {e}.")
         return None, None
-
-DH_P = int(
-    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1"
-    "29024E088A67CC74020BBEA63B139B22514A08798E3404DD"
-    "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245"
-    "E485B576625E7EC6F44C42E9A63A3620FFFFFFFFFFFFFFFF", 16)
-DH_G = 2
 
 def encrypt_message(message, key):
     try:
@@ -318,39 +388,6 @@ def start_key_exchange_server(host='0.0.0.0', port=ENCRYPTED_PORT):
         client_thread = threading.Thread(target=handle_key_exchange, args=(client_socket, client_address))
         client_thread.start()
 
-def load_users():
-    if os.path.exists(users_file):
-        with open(users_file, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return {}
-
-def save_users(users):
-    with open(users_file, 'w', encoding='utf-8') as f:
-        json.dump(users, f, ensure_ascii=False, indent=4)
-
-def load_servers():
-    servers = {}
-    for filename in os.listdir(servers_dir):
-        if filename.endswith('.json'):
-            server_name = filename[:-5]
-            with open(os.path.join(servers_dir, filename), 'r', encoding='utf-8') as f:
-                servers[server_name] = json.load(f)
-    return servers
-
-def save_server(server_name, server_data):
-    with open(os.path.join(servers_dir, f'{server_name}.json'), 'w', encoding='utf-8') as f:
-        json.dump(server_data, f, ensure_ascii=False, indent=4)
-
-def load_bans():
-    if os.path.exists(bans_file):
-        with open(bans_file, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return {}
-
-def save_bans(bans):
-    with open(bans_file, 'w', encoding='utf-8') as f:
-        json.dump(bans, f, ensure_ascii=False, indent=4)
-
 def is_valid_base64(s):
     try:
         if not re.match(r'^[A-Za-z0-9+/]*={0,2}$', s):
@@ -428,22 +465,6 @@ def authenticate_user(username, password, stored_users):
     
     return False
 
-users = load_users()
-bans = load_bans()
-servers = load_servers()
-
-from caps.caps import CapabilitiesManager
-capabilities_manager = CapabilitiesManager()
-
-default_server = 'general'
-if default_server not in servers:
-    servers[default_server] = []
-    save_server(default_server, servers[default_server])
-
-members_by_room = {}
-remote_subscribers_by_room = {}
-user_remote_counters = {}
-
 def _room_members(room):
     return members_by_room.setdefault(room, {})
 
@@ -504,11 +525,6 @@ def _update_remote_subscriber_count(room, origin_host):
     else:
         subs.discard(origin_host)
 
-dialback_cache = {}
-DIALBACK_CACHE_TTL = 3600
-
-pending_dialback = {}
-
 def get_cached_dialback_result(host, msg_type):
     cache_key = f"{host}:{msg_type}"
     if cache_key in dialback_cache:
@@ -522,9 +538,6 @@ def get_cached_dialback_result(host, msg_type):
 def cache_dialback_result(host, msg_type, result):
     cache_key = f"{host}:{msg_type}"
     dialback_cache[cache_key] = (time.time(), result)
-
-MAX_RETRIES = 2
-RETRY_DELAY = 1
 
 def send_with_retry(func, *args, **kwargs):
     try:
@@ -691,19 +704,6 @@ def get_client_encryption_key(session):
     except:
         return None
 
-commands = {
-    "/login": "<username> <password> - Login with username and password.",
-    "/register": "<username> <password> - Register a new user.",
-    "/create_server": "<server name> - Create a new communication server.",
-    "/join_server": "<server name > - Log in to the communication server.",
-    "/list_servers": "- Get a list of all available servers for communication.",
-    "/members": "- Get list of users on server.",
-    "/pm": "<username> <message> - Send a private message to the specified user.",
-    "/act": "<action> - Chat action, set your status.",
-    "/list_capabilities": "- Get a list of all available capabilities.",
-    "/help": "- Shows this message."
-}
-
 def generate_msg_id(sender, recipient, message):
     base = f"{sender}:{recipient}:{message}:{int(time.time())}"
     return hashlib.sha256(base.encode()).hexdigest()
@@ -784,6 +784,8 @@ def handle_remote_pm_tcp(sender, recipient, host, private_message, client_socket
                 send_to_client(client_socket, "User does not exist.", client_key)
             except Exception:
                 pass
+                
+            _kick_user(recipient)
             return
     notify_tcp_result(client_socket, status, recipient_display, client_key)
 
@@ -1296,6 +1298,8 @@ def handle_client(client_socket, client_address):
                             continue
                     if recipient not in users:
                         send_to_client(client_socket, "User does not exist.", client_key)
+                        # Удаляем получателя со всех локальных серверов при ошибке
+                        _kick_user(recipient)
                         continue
                     if recipient == logged_in_user:
                         send_to_client(client_socket, "You cannot send private messages to yourself.", client_key)
@@ -1305,6 +1309,9 @@ def handle_client(client_socket, client_address):
                         continue
 
                     result = send_private_message(logged_in_user, recipient, private_message)
+                    if not result:
+                        # Удаляем получателя со всех локальных серверов при ошибке отправки
+                        _kick_user(recipient)
                     notify_tcp_result(client_socket, result, recipient, client_key)
                 elif message.startswith("/help"):
                     help_message = "\n".join([f"{cmd} {desc}" for cmd, desc in commands.items()])
@@ -1514,6 +1521,81 @@ def _send_remote_room_sync(target_host, target_port, data):
     
     return send_with_retry(_send_room_msg)
 
+def _kick_user(username):
+    try:
+        removed_from_servers = []
+
+        for server_name in list(servers.keys()):
+            if '@' in server_name:
+                continue
+
+            room_map = _room_members(server_name)
+            
+            for (user, origin_host) in list(room_map.keys()):
+                if user == username and origin_host == MY_SERVER_HOST:
+                    last = _authoritative_room_remove_member(server_name, username, origin_host)
+                    
+                    if last:
+                        broadcast_message(f"*** {username} has left the server.", server_name)
+
+                        members = servers.get(server_name, [])
+                        
+                        if username in members:
+                            members.remove(username)
+                            servers[server_name] = members
+                            save_server(server_name, members)
+
+                        removed_from_servers.append(server_name)
+                    break
+
+    except Exception as e:
+        log_message(f"Error: {e}.")
+
+def cleanup_OU():
+    try:
+        with session_lock:
+            active_users_by_server = {}
+            for server_name, sessions in clients_by_server.items():
+                active_users_by_server[server_name] = {sess.username for sess in sessions if sess.username}
+
+        for server_name in list(servers.keys()):
+            room_map = _room_members(server_name)
+            users_to_remove = []
+
+            if '@' not in server_name:
+                active_users_on_server = active_users_by_server.get(server_name, set())
+
+                for (username, origin_host) in list(room_map.keys()):
+                    if origin_host == MY_SERVER_HOST:
+                        if username not in active_users_on_server:
+                            users_to_remove.append((username, origin_host))
+                    else:
+                        subs = _remote_subscribers(server_name)
+                        if origin_host not in subs:
+                            users_to_remove.append((username, origin_host))
+            else:
+                room_name, host_part = server_name.split('@', 1)
+                subs = _remote_subscribers(room_name)
+                if host_part not in subs:
+                    for (username, origin_host) in list(room_map.keys()):
+                        if origin_host == host_part:
+                            users_to_remove.append((username, origin_host))
+
+            for username, origin_host in users_to_remove:
+                last = _authoritative_room_remove_member(server_name, username, origin_host)
+                if last:
+                    broadcast_message(f"*** {username} has left the server.", server_name)
+
+                    if '@' not in server_name:
+                        members = servers.get(server_name, [])
+                        if username in members:
+                            members.remove(username)
+                            servers[server_name] = members
+                            save_server(server_name, members)
+
+    except Exception as e:
+        log_message(f"Error: {e}.")
+
 def cleanup_tasks():
     while True:
         time.sleep(60)
@@ -1524,6 +1606,8 @@ def cleanup_tasks():
                 to_remove.append(key)
         for key in to_remove:
             del dialback_cache[key]
+
+        cleanup_OU()
 
 if __name__ == "__main__":
     threading.Thread(target=cleanup_tasks, daemon=True).start()
