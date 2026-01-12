@@ -1562,24 +1562,16 @@ def cleanup_OU():
             room_map = _room_members(server_name)
             users_to_remove = []
 
-            if '@' not in server_name:
-                active_users_on_server = active_users_by_server.get(server_name, set())
+            active_users_on_server = active_users_by_server.get(server_name, set())
 
-                for (username, origin_host) in list(room_map.keys()):
-                    if origin_host == MY_SERVER_HOST:
-                        if username not in active_users_on_server:
-                            users_to_remove.append((username, origin_host))
-                    else:
-                        subs = _remote_subscribers(server_name)
-                        if origin_host not in subs:
-                            users_to_remove.append((username, origin_host))
-            else:
-                room_name, host_part = server_name.split('@', 1)
-                subs = _remote_subscribers(room_name)
-                if host_part not in subs:
-                    for (username, origin_host) in list(room_map.keys()):
-                        if origin_host == host_part:
-                            users_to_remove.append((username, origin_host))
+            for (username, origin_host) in list(room_map.keys()):
+                if origin_host == MY_SERVER_HOST:
+                    if username not in active_users_on_server:
+                        users_to_remove.append((username, origin_host))
+                else:
+                    subs = _remote_subscribers(server_name)
+                    if origin_host not in subs:
+                        users_to_remove.append((username, origin_host))
 
             for username, origin_host in users_to_remove:
                 last = _authoritative_room_remove_member(server_name, username, origin_host)
