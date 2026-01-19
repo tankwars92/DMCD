@@ -38,7 +38,11 @@ def save_users(users):
         json.dump(users, f, ensure_ascii=False, indent=4)
 
 def load_servers():
+    if not os.path.exists(servers_dir):
+        os.makedirs(servers_dir)
+    
     servers = {}
+
     for filename in os.listdir(servers_dir):
         if filename.endswith('.json'):
             server_name = filename[:-5]
